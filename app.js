@@ -218,7 +218,7 @@ function compassSVG(rotDeg, big) {
 }
 
 /* ---------------- app state & routing ---------------- */
-const APP_VERSION = '2026-08-29.3';
+const APP_VERSION = '2026-08-29.4';
 const root = document.getElementById('app-root');
 let state = { hunts: [], newHunt: null };
 
@@ -449,13 +449,12 @@ function renderTrimStep() {
 
   const map = L.map('trimMap', { zoomControl: true, attributionControl: false });
   const fullLine = L.polyline(nh.dogPts.map((p) => [p.lat, p.lon]), { color: '#4c8fbd', weight: 3, opacity: 0.9 }).addTo(map);
-  map.fitBounds(fullLine.getBounds());
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
-  // Leaflet sizes itself from the container at init time; when the container
-  // is injected via innerHTML the layout isn't always settled yet, which can
-  // leave the track/tiles misplaced or missing until the map is told to
-  // re-measure itself.
-  setTimeout(() => map.invalidateSize(), 0);
+  // Leaflet reads the container's size at the moment fitBounds/invalidateSize
+  // run. Right after an innerHTML swap that size can still be 0 for a tick,
+  // which makes fitBounds compute a bogus view — so we wait a tick before
+  // ever calling it, not just before invalidateSize.
+  setTimeout(() => { map.invalidateSize(); map.fitBounds(fullLine.getBounds()); }, 0);
   setTimeout(() => map.invalidateSize(), 250);
   let startMarker = L.circleMarker([nh.dogPts[0].lat, nh.dogPts[0].lon], { radius: 7, color: '#7a9b6e', fillColor: '#7a9b6e', fillOpacity: 1 }).addTo(map);
   let endMarker = L.circleMarker([nh.dogPts[nh.dogPts.length - 1].lat, nh.dogPts[nh.dogPts.length - 1].lon], { radius: 7, color: '#e8541e', fillColor: '#e8541e', fillOpacity: 1 }).addTo(map);
@@ -595,7 +594,13 @@ async function renderHuntDetail(id) {
     if (allPts.length) map.fitBounds(allPts);
   }
   drawTrack();
-  setTimeout(() => map.invalidateSize(), 0);
+  // Defer the first fitBounds until the container has a real, laid-out size —
+  // right after an innerHTML swap it can still read as 0×0 for a tick, which
+  // makes fitBounds compute a bogus view (this was almost certainly why the
+  // track looked replaced by "something else": the map was just looking at
+  // the wrong region). Toggling later is safe inline since the map is sized
+  // correctly by then.
+  setTimeout(() => { map.invalidateSize(); drawTrack(); }, 0);
   setTimeout(() => map.invalidateSize(), 250);
 
   const windToggleBtn = document.getElementById('windToggleBtn');
@@ -894,21 +899,23 @@ function init3D(stats, hunt, elevData) {
     lastX = x; lastY = y;
     setCamera();
   }
+  function onWindowMouseMove(e) { onMove(e.clientX, e.clientY); }
   function onUp() {
     dragging = false;
     idleTimer = setTimeout(() => { autoRotate = true; }, 2500);
   }
+  function onWheel(e) {
+    radius = Math.max(20, Math.min(radius0 * 3, radius + e.deltaY * 0.5));
+    setCamera();
+    e.preventDefault();
+  }
   canvas.addEventListener('mousedown', (e) => onDown(e.clientX, e.clientY));
-  window.addEventListener('mousemove', (e) => onMove(e.clientX, e.clientY));
+  window.addEventListener('mousemove', onWindowMouseMove);
   window.addEventListener('mouseup', onUp);
   canvas.addEventListener('touchstart', (e) => { const t = e.touches[0]; onDown(t.clientX, t.clientY); }, { passive: true });
   canvas.addEventListener('touchmove', (e) => { const t = e.touches[0]; onMove(t.clientX, t.clientY); }, { passive: true });
   canvas.addEventListener('touchend', onUp);
-  canvas.addEventListener('wheel', (e) => {
-    radius = Math.max(20, Math.min(radius0 * 3, radius + e.deltaY * 0.5));
-    setCamera();
-    e.preventDefault();
-  }, { passive: false });
+  canvas.addEventListener('wheel', onWheel, { passive: false });
 
   let raf;
   function animate() {
@@ -924,12 +931,24 @@ function init3D(stats, hunt, elevData) {
     renderer.setSize(W(), H());
   }
   window.addEventListener('resize', onResize);
+  // Two-tier re-measure, same fix as the Leaflet maps: right after the
+  // innerHTML swap the wrapper can still read 0×0 for a tick, which would
+  // otherwise leave the WebGL canvas sized to nothing.
   setTimeout(onResize, 0);
+  setTimeout(onResize, 250);
 
   const cleanup = () => {
     cancelAnimationFrame(raf);
     window.removeEventListener('resize', onResize);
+    window.removeEventListener('mousemove', onWindowMouseMove);
+    window.removeEventListener('mouseup', onUp);
     window.removeEventListener('hashchange', cleanup);
+    clearTimeout(idleTimer);
+    // Explicitly free the WebGL context instead of waiting on garbage
+    // collection — repeated visits to this view without this would
+    // eventually exhaust the browser's limited number of WebGL contexts
+    // and silently break future 3D views.
+    renderer.dispose();
   };
   window.addEventListener('hashchange', cleanup, { once: true });
 }
