@@ -1,6 +1,6 @@
 {
-  "name": "Kvartér — jakthundlogg",
-  "short_name": "Kvartér",
+  "name": "GundogHunting",
+  "short_name": "GundogHunt",
   "description": "Analyser jaktturer fra GPS-halsbånd og håndenhet: søksmønster, stand og vind.",
   "start_url": "./index.html",
   "scope": "./",

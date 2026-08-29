@@ -1,5 +1,5 @@
 /* ============================================================
-   Kvartér — lokal jakthundlogg
+   GundogHunting — lokal jakthundlogg
    All data lives in this browser's IndexedDB. Nothing leaves the device.
    ============================================================ */
 
@@ -218,7 +218,7 @@ function compassSVG(rotDeg, big) {
 }
 
 /* ---------------- app state & routing ---------------- */
-const APP_VERSION = '2026-08-29.5';
+const APP_VERSION = '2026-08-29.6';
 const root = document.getElementById('app-root');
 let state = { hunts: [], newHunt: null };
 
@@ -255,7 +255,7 @@ function renderDashboard() {
   const hunts = state.hunts;
   root.innerHTML = `
     <header class="topbar">
-      <div class="brand"><span>Kvartér</span><span class="dot">·</span></div>
+      <div class="brand"><span>GundogHunting</span><span class="dot">·</span></div>
       <div class="brand-sub">${hunts.length} logget · v${APP_VERSION}</div>
     </header>
     <main>

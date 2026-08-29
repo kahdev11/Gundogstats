@@ -1,4 +1,4 @@
-# Kvartér — jakthundlogg
+# GundogHunting
 
 En installerbar app (PWA) som analyserer GPX-spor fra GPS-halsbånd (f.eks. Garmin T20)
 og håndenhet (f.eks. Alpha 300i): distanse, stand-deteksjon, avstand fører–hund, og
@@ -37,15 +37,21 @@ etter første åpning.
 ## Backup
 
 Bruk "Eksporter alle data" på forsiden for å laste ned en JSON-fil med alt.
-Nyttig hvis du bytter telefon eller sletter appen ved et uhell.
+"Importer backup" gjenoppretter fra en slik fil. Nyttig hvis du bytter telefon
+eller sletter appen ved et uhell.
+
+## Hvis en oppdatering ikke slår igjennom
+
+Trykk "Tving oppdatering av appen" nederst på forsiden. Fjerner kun mellomlagret
+app-kode, aldri jakthistorikken din.
 
 ## Filstruktur
 
 ```
 index.html      — app-skallet
 styles.css      — design
-app.js          — all logikk: GPX-parsing, statistikk, kart, lagring
+app.js          — all logikk: GPX-parsing, statistikk, kart, 3D, lagring
 manifest.json   — PWA-konfigurasjon
 sw.js           — offline-støtte
-icons/          — app-ikoner
+icons/          — app-ikoner (jakthund-silhuett)
 ```
