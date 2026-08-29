@@ -244,6 +244,7 @@ async function router() {
   await refreshHunts();
   if (view === 'new') renderNewHunt();
   else if (view === 'hunt' && payload) renderHuntDetail(payload);
+  else if (view === 'hunt3d' && payload) renderHunt3D(payload);
   else renderDashboard();
 }
 window.addEventListener('hashchange', router);
@@ -261,15 +262,17 @@ function renderDashboard() {
         <div class="empty-state">
           <div class="glyph">🧭</div>
           <h3>Ingen turer logget ennå</h3>
-          <p>Last opp GPX-filer fra hundens halsbånd (og gjerne håndenheten din) for å komme i gang.</p>
+          <p>Last opp GPX-filer fra hundens halsbånd (og gjerne håndenheten din) for å komme i gang. Har du en tidligere backup-fil? Importer den under.</p>
         </div>
       ` : `
         <div class="section-label">Logg</div>
         ${hunts.map(huntCardHTML).join('')}
-        <div style="margin-top:24px;">
-          <button class="btn btn-ghost btn-block" id="exportBtn">Eksporter alle data (backup)</button>
-        </div>
       `}
+      <div style="margin-top:24px;display:flex;flex-direction:column;gap:8px;">
+        ${hunts.length > 0 ? '<button class="btn btn-ghost btn-block" id="exportBtn">Eksporter alle data (backup)</button>' : ''}
+        <button class="btn btn-ghost btn-block" id="importBtn">Importer backup</button>
+        <input type="file" id="importFile" accept=".json" class="hidden">
+      </div>
     </main>
     <button class="btn btn-primary fab" id="newHuntBtn">+ Ny jakttur</button>
   `;
@@ -280,6 +283,26 @@ function renderDashboard() {
   });
   const exportBtn = document.getElementById('exportBtn');
   if (exportBtn) exportBtn.onclick = exportAllData;
+  const importBtn = document.getElementById('importBtn');
+  const importFile = document.getElementById('importFile');
+  importBtn.onclick = () => importFile.click();
+  importFile.onchange = async (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+    try {
+      const text = await f.text();
+      const data = JSON.parse(text);
+      if (!Array.isArray(data)) throw new Error('Ugyldig format');
+      for (const hunt of data) {
+        if (!hunt.id || !hunt.dogPts) continue;
+        await dbPut(hunt);
+      }
+      toast(`Importerte ${data.length} jaktturer`);
+      router();
+    } catch (err) {
+      toast('Kunne ikke lese filen — er det en gyldig backup?');
+    }
+  };
 }
 
 function huntCardHTML(h) {
@@ -427,6 +450,12 @@ function renderTrimStep() {
   const fullLine = L.polyline(nh.dogPts.map((p) => [p.lat, p.lon]), { color: '#4c8fbd', weight: 3, opacity: 0.9 }).addTo(map);
   map.fitBounds(fullLine.getBounds());
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+  // Leaflet sizes itself from the container at init time; when the container
+  // is injected via innerHTML the layout isn't always settled yet, which can
+  // leave the track/tiles misplaced or missing until the map is told to
+  // re-measure itself.
+  setTimeout(() => map.invalidateSize(), 0);
+  setTimeout(() => map.invalidateSize(), 250);
   let startMarker = L.circleMarker([nh.dogPts[0].lat, nh.dogPts[0].lon], { radius: 7, color: '#7a9b6e', fillColor: '#7a9b6e', fillOpacity: 1 }).addTo(map);
   let endMarker = L.circleMarker([nh.dogPts[nh.dogPts.length - 1].lat, nh.dogPts[nh.dogPts.length - 1].lon], { radius: 7, color: '#e8541e', fillColor: '#e8541e', fillOpacity: 1 }).addTo(map);
 
@@ -518,7 +547,8 @@ async function renderHuntDetail(id) {
           <div class="wind-bar-row"><span class="lbl">På tvers</span><div class="wind-bar-track"><div class="wind-bar-fill" style="width:${stats.wind.pct.cross}%;background:#93998c;"></div></div><span class="pct">${fmt.pct(stats.wind.pct.cross)}</span></div>
         </div>
       ` : ''}
-      <button class="btn btn-ghost btn-block" id="deleteBtn" style="margin-top:20px;">Slett denne turen</button>
+      <button class="btn btn-primary btn-block" id="view3dBtn" style="margin-top:6px;">Vis spor i 3D</button>
+      <button class="btn btn-ghost btn-block" id="deleteBtn" style="margin-top:10px;">Slett denne turen</button>
     </main>
   `;
   document.getElementById('backBtn').onclick = () => navigate('');
@@ -555,6 +585,276 @@ async function renderHuntDetail(id) {
   });
   if (allPts.length) map.fitBounds(allPts);
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+  setTimeout(() => map.invalidateSize(), 0);
+  setTimeout(() => map.invalidateSize(), 250);
+
+  document.getElementById('view3dBtn').onclick = () => navigate('hunt3d', id);
+}
+
+/* ---------------- elevation lookup (EU-DEM via Open Topo Data — free, no key, covers Norway) ---------------- */
+async function fetchElevations(latlonPairs) {
+  // Public API limits: max 100 locations/request, 1 req/sec, 1000/day — fine for a single track.
+  const locStr = latlonPairs.map(([lat, lon]) => `${lat.toFixed(6)},${lon.toFixed(6)}`).join('|');
+  const url = `https://api.opentopodata.org/v1/eudem25m?locations=${locStr}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('Elevation API svarte ' + res.status);
+  const data = await res.json();
+  if (data.status !== 'OK') throw new Error(data.error || 'Ukjent feil fra høyde-API');
+  return data.results.map((r) => (r.elevation == null ? 0 : r.elevation));
+}
+
+/* ---------------- 3D view (real terrenghøyde via EU-DEM) ---------------- */
+async function renderHunt3D(id) {
+  const db = await openDB();
+  const hunt = await new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readonly');
+    const req = tx.objectStore(STORE).get(id);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  if (!hunt) { navigate(''); return; }
+  const stats = computeStats(hunt);
+
+  root.innerHTML = `
+    <header class="topbar">
+      <div class="back-row" style="padding:0;">
+        <button class="back-btn" id="backBtn">←</button>
+        <div class="hunt-title">Spor i 3D</div>
+      </div>
+    </header>
+    <main style="padding-left:0;padding-right:0;">
+      <div id="three-status" class="note" style="margin:0 20px 10px;">Henter terrenghøyde for området …</div>
+      <div id="three-wrap" style="width:100%;height:60vh;min-height:360px;position:relative;background:radial-gradient(ellipse at 50% 20%, #1c2a1d, #0d130e);">
+        <canvas id="three-canvas" style="display:block;width:100%;height:100%;touch-action:none;"></canvas>
+      </div>
+      <div class="legend" style="padding:0 20px;margin-top:12px;">
+        ${stats.wind ? `
+          <span><span class="swatch" style="background:#4c8fbd"></span>Mot vind</span>
+          <span><span class="swatch" style="background:#e8541e"></span>Med vind</span>
+          <span><span class="swatch" style="background:#93998c"></span>På tvers</span>
+        ` : `
+          <span><span class="swatch" style="background:#4c8fbd"></span>Rolig</span>
+          <span><span class="swatch" style="background:#e8541e"></span>Høy fart</span>
+        `}
+        <span><span class="swatch" style="background:#7a9b6e;border-radius:50%;width:8px;height:8px;"></span>Stand</span>
+      </div>
+    </main>
+  `;
+  document.getElementById('backBtn').onclick = () => navigate('hunt', id);
+
+  const statusEl = document.getElementById('three-status');
+
+  // downsample up-front so we only ever need ONE elevation request (API limit: 100 locations)
+  function downsample(arr, target) {
+    if (arr.length <= target) return arr;
+    const step = Math.ceil(arr.length / target);
+    const out = arr.filter((_, i) => i % step === 0);
+    if (out[out.length - 1] !== arr[arr.length - 1]) out.push(arr[arr.length - 1]);
+    return out;
+  }
+  const dogDS = downsample(stats.dogPts, 90);
+  const standPts = stats.stands.map((s) => ({ lat: s.lat, lon: s.lon }));
+  const lookupPts = [...dogDS, ...standPts];
+
+  let elevations = null;
+  try {
+    elevations = await fetchElevations(lookupPts.map((p) => [p.lat, p.lon]));
+    statusEl.textContent = 'Terreng fra EU-DEM (Copernicus) — posisjon vist på ekte høyde.';
+  } catch (err) {
+    statusEl.textContent = 'Fikk ikke hentet terrenghøyde akkurat nå (nettverk eller høyde-API utilgjengelig) — viser sporet flatt i stedet.';
+  }
+
+  const dogElev = elevations ? elevations.slice(0, dogDS.length) : null;
+  const standElev = elevations ? elevations.slice(dogDS.length) : null;
+
+  init3D(stats, hunt, { dogDS, dogElev, standElev });
+}
+
+function init3D(stats, hunt, elevData) {
+  const canvas = document.getElementById('three-canvas');
+  const wrap = document.getElementById('three-wrap');
+  const W = () => wrap.clientWidth, H = () => wrap.clientHeight;
+  const { dogDS, dogElev, standElev } = elevData;
+
+  // project lat/lon to local meters around the track's centroid
+  const lat0 = dogDS[Math.floor(dogDS.length / 2)].lat;
+  const lon0 = dogDS[Math.floor(dogDS.length / 2)].lon;
+  const mPerLat = 111320;
+  const mPerLon = 111320 * Math.cos(toRad(lat0));
+  const project = (p) => [
+    (p.lon - lon0) * mPerLon,
+    (p.lat - lat0) * mPerLat,
+  ];
+
+  function downsample(arr, target) {
+    if (arr.length <= target) return arr;
+    const step = Math.ceil(arr.length / target);
+    const out = arr.filter((_, i) => i % step === 0);
+    if (out[out.length - 1] !== arr[arr.length - 1]) out.push(arr[arr.length - 1]);
+    return out;
+  }
+
+  const VERTICAL_EXAGGERATION = 1.8;
+  const minElev = dogElev ? Math.min(...dogElev) : 0;
+  const elevY = (i) => (dogElev ? (dogElev[i] - minElev) * VERTICAL_EXAGGERATION : 0);
+
+  // speed per point — used for color when there's no wind classification
+  const speeds = [0];
+  for (let i = 1; i < dogDS.length; i++) {
+    const d = haversine(dogDS[i - 1].lat, dogDS[i - 1].lon, dogDS[i].lat, dogDS[i].lon);
+    const dt = (dogDS[i].t - dogDS[i - 1].t) / 1000;
+    speeds.push(dt > 0 ? Math.min((d / dt) * 3.6, 25) : 0);
+  }
+  const colorFor = (i) => {
+    const frac = Math.min(speeds[i] / 12, 1);
+    const c1 = new THREE.Color(0x4c8fbd), c2 = new THREE.Color(0xe8541e);
+    return c1.clone().lerp(c2, frac);
+  };
+
+  let catForIdx = null;
+  if (stats.wind) {
+    catForIdx = dogDS.map((p) => {
+      let best = null, bestD = Infinity;
+      stats.wind.segs.forEach((s) => {
+        const dmid = haversine(p.lat, p.lon, (s.start[0] + s.end[0]) / 2, (s.start[1] + s.end[1]) / 2);
+        if (dmid < bestD) { bestD = dmid; best = s.cat; }
+      });
+      return best || 'cross';
+    });
+  }
+  const catColors = { upwind: 0x4c8fbd, downwind: 0xe8541e, cross: 0x93998c };
+
+  // build geometry
+  const positions = [];
+  const colors = [];
+  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+  dogDS.forEach((p, i) => {
+    const [x, z] = project(p);
+    const y = elevY(i);
+    positions.push(x, y, z);
+    const col = catForIdx ? new THREE.Color(catColors[catForIdx[i]]) : colorFor(i);
+    colors.push(col.r, col.g, col.b);
+    minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+    minZ = Math.min(minZ, z); maxZ = Math.max(maxZ, z);
+  });
+
+  const scene = new THREE.Scene();
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+  const mat = new THREE.LineBasicMaterial({ vertexColors: true, linewidth: 2 });
+  const line = new THREE.Line(geo, mat);
+  scene.add(line);
+
+  // hunter track: projected onto the same terrain profile via nearest dog-point elevation
+  if (stats.hunterPts && stats.hunterPts.length > 1 && dogElev) {
+    const hDS = downsample(stats.hunterPts, 250);
+    const hPos = [];
+    hDS.forEach((p) => {
+      const [x, z] = project(p);
+      let best = 0, bestD = Infinity;
+      dogDS.forEach((dp, i) => {
+        const dd = haversine(p.lat, p.lon, dp.lat, dp.lon);
+        if (dd < bestD) { bestD = dd; best = i; }
+      });
+      hPos.push(x, elevY(best) + 0.4, z);
+    });
+    const hGeo = new THREE.BufferGeometry();
+    hGeo.setAttribute('position', new THREE.Float32BufferAttribute(hPos, 3));
+    const hMat = new THREE.LineBasicMaterial({ color: 0xede6d6, transparent: true, opacity: 0.6 });
+    scene.add(new THREE.Line(hGeo, hMat));
+  }
+
+  // stands as small glowing spheres, on the real terrain height
+  stats.stands.forEach((s, i) => {
+    const [x, z] = project(s);
+    const y = standElev ? (standElev[i] - minElev) * VERTICAL_EXAGGERATION : 0;
+    const geo2 = new THREE.SphereGeometry(0.9, 16, 16);
+    const mat2 = new THREE.MeshBasicMaterial({ color: 0x7a9b6e });
+    const sph = new THREE.Mesh(geo2, mat2);
+    sph.position.set(x, y + 0.9, z);
+    scene.add(sph);
+  });
+
+  // ground grid at base elevation
+  const spanX = Math.max(maxX - minX, 50), spanZ = Math.max(maxZ - minZ, 50);
+  const gridSize = Math.max(spanX, spanZ) * 1.4;
+  const grid = new THREE.GridHelper(gridSize, 24, 0x33402f, 0x232f21);
+  grid.position.set((minX + maxX) / 2, 0, (minZ + maxZ) / 2);
+  scene.add(grid);
+
+  const maxY = dogElev ? Math.max(...dogElev.map((_, i) => elevY(i))) : 0;
+  const centerX = (minX + maxX) / 2, centerZ = (minZ + maxZ) / 2;
+  const target = new THREE.Vector3(centerX, maxY / 2 + 2, centerZ);
+  const radius0 = Math.max(spanX, spanZ) * 0.9 + 40;
+
+  const camera = new THREE.PerspectiveCamera(52, W() / H(), 0.1, gridSize * 4);
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.setSize(W(), H());
+
+  let azimuth = Math.PI * 0.25, elevation = 0.55, radius = radius0;
+  let dragging = false, lastX = 0, lastY = 0, idleTimer = null, autoRotate = true;
+
+  function setCamera() {
+    const cy = Math.sin(elevation) * radius;
+    const ch = Math.cos(elevation) * radius;
+    camera.position.set(
+      target.x + Math.cos(azimuth) * ch,
+      target.y + cy,
+      target.z + Math.sin(azimuth) * ch
+    );
+    camera.lookAt(target);
+  }
+  setCamera();
+
+  function onDown(x, y) { dragging = true; lastX = x; lastY = y; autoRotate = false; clearTimeout(idleTimer); }
+  function onMove(x, y) {
+    if (!dragging) return;
+    const dx = x - lastX, dy = y - lastY;
+    azimuth -= dx * 0.006;
+    elevation = Math.max(0.12, Math.min(1.4, elevation + dy * 0.005));
+    lastX = x; lastY = y;
+    setCamera();
+  }
+  function onUp() {
+    dragging = false;
+    idleTimer = setTimeout(() => { autoRotate = true; }, 2500);
+  }
+  canvas.addEventListener('mousedown', (e) => onDown(e.clientX, e.clientY));
+  window.addEventListener('mousemove', (e) => onMove(e.clientX, e.clientY));
+  window.addEventListener('mouseup', onUp);
+  canvas.addEventListener('touchstart', (e) => { const t = e.touches[0]; onDown(t.clientX, t.clientY); }, { passive: true });
+  canvas.addEventListener('touchmove', (e) => { const t = e.touches[0]; onMove(t.clientX, t.clientY); }, { passive: true });
+  canvas.addEventListener('touchend', onUp);
+  canvas.addEventListener('wheel', (e) => {
+    radius = Math.max(20, Math.min(radius0 * 3, radius + e.deltaY * 0.5));
+    setCamera();
+    e.preventDefault();
+  }, { passive: false });
+
+  let raf;
+  function animate() {
+    raf = requestAnimationFrame(animate);
+    if (autoRotate) { azimuth += 0.0015; setCamera(); }
+    renderer.render(scene, camera);
+  }
+  animate();
+
+  function onResize() {
+    camera.aspect = W() / H();
+    camera.updateProjectionMatrix();
+    renderer.setSize(W(), H());
+  }
+  window.addEventListener('resize', onResize);
+  setTimeout(onResize, 0);
+
+  const cleanup = () => {
+    cancelAnimationFrame(raf);
+    window.removeEventListener('resize', onResize);
+    window.removeEventListener('hashchange', cleanup);
+  };
+  window.addEventListener('hashchange', cleanup, { once: true });
 }
 
 /* ---------------- boot ---------------- */
