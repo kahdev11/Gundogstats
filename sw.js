@@ -1,4 +1,4 @@
-const CACHE = 'kvarter-v3';
+const CACHE = 'kvarter-v4';
 const SHELL = [
   './',
   './index.html',

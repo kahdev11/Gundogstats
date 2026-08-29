@@ -218,7 +218,7 @@ function compassSVG(rotDeg, big) {
 }
 
 /* ---------------- app state & routing ---------------- */
-const APP_VERSION = '2026-08-29.4';
+const APP_VERSION = '2026-08-29.5';
 const root = document.getElementById('app-root');
 let state = { hunts: [], newHunt: null };
 
@@ -273,6 +273,7 @@ function renderDashboard() {
         ${hunts.length > 0 ? '<button class="btn btn-ghost btn-block" id="exportBtn">Eksporter alle data (backup)</button>' : ''}
         <button class="btn btn-ghost btn-block" id="importBtn">Importer backup</button>
         <input type="file" id="importFile" accept=".json" class="hidden">
+        <button class="btn btn-ghost btn-block" id="forceUpdateBtn">Tving oppdatering av appen</button>
       </div>
     </main>
     <button class="btn btn-primary fab" id="newHuntBtn">+ Ny jakttur</button>
@@ -284,6 +285,22 @@ function renderDashboard() {
   });
   const exportBtn = document.getElementById('exportBtn');
   if (exportBtn) exportBtn.onclick = exportAllData;
+  document.getElementById('forceUpdateBtn').onclick = async () => {
+    try {
+      if ('serviceWorker' in navigator) {
+        const regs = await navigator.serviceWorker.getRegistrations();
+        await Promise.all(regs.map((r) => r.unregister()));
+      }
+      if ('caches' in window) {
+        const keys = await caches.keys();
+        await Promise.all(keys.map((k) => caches.delete(k)));
+      }
+      toast('Oppdaterer …');
+      setTimeout(() => window.location.reload(true), 400);
+    } catch (err) {
+      toast('Fikk ikke tvunget oppdatering — prøv å lukke og åpne appen på nytt');
+    }
+  };
   const importBtn = document.getElementById('importBtn');
   const importFile = document.getElementById('importFile');
   importBtn.onclick = () => importFile.click();
@@ -956,5 +973,7 @@ function init3D(stats, hunt, elevData) {
 /* ---------------- boot ---------------- */
 router();
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('./sw.js').catch(() => {});
+  navigator.serviceWorker.register('./sw.js', { updateViaCache: 'none' })
+    .then((reg) => reg.update().catch(() => {}))
+    .catch(() => {});
 }
