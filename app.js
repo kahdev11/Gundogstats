@@ -130,6 +130,84 @@ function windSegments(pts, windFromDeg, binSize = 40) {
   };
 }
 
+/* ---------------- critical speed (endurance model across saved hunts) ----------------
+ * Linear reformulation of the speed-duration / "critical power" model used in
+ * Rozier-Delgado et al. 2025 (J Exp Biol) for hunting dogs on GPS collars:
+ * distance = CS * duration + D'  — where CS (the regression slope) is the
+ * critical speed (sustainable "forever" pace) and D' (the intercept) is the
+ * finite distance reserve available above that pace. Fit by ordinary least
+ * squares on each duration's best-ever effort across all saved hunts — far
+ * more numerically stable in-browser than fitting the equivalent hyperbola
+ * directly, and mathematically the same model. */
+function bestEffortDistance(pts, durationSec) {
+  const n = pts.length;
+  if (n < 2) return null;
+  const totalDur = (pts[n - 1].t - pts[0].t) / 1000;
+  if (totalDur < durationSec) return null;
+  const cumDist = [0];
+  for (let i = 1; i < n; i++) {
+    cumDist.push(cumDist[i - 1] + haversine(pts[i - 1].lat, pts[i - 1].lon, pts[i].lat, pts[i].lon));
+  }
+  let best = 0, j = 0;
+  for (let i = 0; i < n; i++) {
+    const targetT = pts[i].t + durationSec * 1000;
+    if (targetT > pts[n - 1].t) break;
+    if (j < i) j = i;
+    while (j < n - 1 && pts[j + 1].t < targetT) j++;
+    let distAtTarget;
+    if (j >= n - 1 || pts[j].t === targetT) distAtTarget = cumDist[j];
+    else {
+      const t0 = pts[j].t, t1 = pts[j + 1].t;
+      const f = t1 === t0 ? 0 : (targetT - t0) / (t1 - t0);
+      distAtTarget = cumDist[j] + f * (cumDist[j + 1] - cumDist[j]);
+    }
+    const d = distAtTarget - cumDist[i];
+    if (d > best) best = d;
+  }
+  return best;
+}
+
+const CS_DURATIONS = [15, 30, 60, 120, 180, 300, 450, 600, 900, 1200];
+
+function computeCriticalSpeedModel(hunts) {
+  const points = [];
+  let huntsUsed = new Set();
+  CS_DURATIONS.forEach((T) => {
+    let best = 0, found = false;
+    hunts.forEach((h) => {
+      if (!h.dogPts) return;
+      const dogPts = h.dogPts.slice(h.trimStart, h.trimEnd + 1);
+      const d = bestEffortDistance(dogPts, T);
+      if (d != null && d > best) { best = d; found = true; huntsUsed.add(h.id); }
+    });
+    if (found) points.push({ duration: T, distance: best });
+  });
+  if (points.length < 4) return { insufficientData: true, points, huntsUsed: huntsUsed.size };
+  const n = points.length;
+  const sumT = points.reduce((a, p) => a + p.duration, 0);
+  const sumD = points.reduce((a, p) => a + p.distance, 0);
+  const sumTT = points.reduce((a, p) => a + p.duration * p.duration, 0);
+  const sumTD = points.reduce((a, p) => a + p.duration * p.distance, 0);
+  const denom = n * sumTT - sumT * sumT;
+  if (denom === 0) return { insufficientData: true, points, huntsUsed: huntsUsed.size };
+  const CS = (n * sumTD - sumT * sumD) / denom; // m/s
+  const Dprime = (sumD - CS * sumT) / n; // meters
+  const insufficientData = !(CS > 0 && isFinite(CS) && isFinite(Dprime));
+  return { CS, Dprime, points, huntsUsed: huntsUsed.size, insufficientData };
+}
+
+function timeAboveSpeed(pts, speedKmhThreshold) {
+  let sec = 0;
+  for (let i = 1; i < pts.length; i++) {
+    const d = haversine(pts[i - 1].lat, pts[i - 1].lon, pts[i].lat, pts[i].lon);
+    const dt = (pts[i].t - pts[i - 1].t) / 1000;
+    if (dt <= 0) continue;
+    const kmh = (d / dt) * 3.6;
+    if (kmh > speedKmhThreshold) sec += dt;
+  }
+  return sec;
+}
+
 function computeStats(hunt) {
   const dogPts = hunt.dogPts.slice(hunt.trimStart, hunt.trimEnd + 1);
   const hunterPts = hunt.hunterPts ? hunt.hunterPts.filter((p) => p.t >= dogPts[0].t && p.t <= dogPts[dogPts.length - 1].t) : null;
@@ -139,7 +217,47 @@ function computeStats(hunt) {
   const stands = detectStands(dogPts);
   const hd = hunterPts && hunterPts.length > 1 ? hunterDogDistanceStats(hunterPts, dogPts) : null;
   const wind = hunt.windFrom != null ? windSegments(dogPts, COMPASS_DEG[hunt.windFrom]) : null;
-  return { dogPts, hunterPts, dogDist, hunterDist, durationMin, stands, hunterDogDist: hd, wind };
+  const homing = detectHomingRun(dogPts, hunterPts);
+  return { dogPts, hunterPts, dogDist, hunterDist, durationMin, stands, hunterDogDist: hd, wind, homing };
+}
+
+/* ---------------- homing behaviour ("compass run") ----------------
+ * Based on Nováková et al. 2020 (dogs equipped with GPS collars): when a
+ * hunting dog returns via a NEW route rather than retracing its outbound
+ * path, it often opens the return with a short (~20 m) run aligned close
+ * to the north–south geomagnetic axis before turning toward the handler.
+ * This looks for that specific signature: the point of maximum distance
+ * from the handler (or the start point if no handler track), then the
+ * bearing of the next ~20 m of movement from there. */
+function detectHomingRun(dogPts, hunterPts) {
+  if (dogPts.length < 5) return null;
+  const usingHandler = !!(hunterPts && hunterPts.length > 1);
+  const ref = usingHandler ? hunterPts[hunterPts.length - 1] : dogPts[0];
+  let maxD = -1, maxIdx = 0;
+  for (let i = 0; i < dogPts.length; i++) {
+    const d = haversine(dogPts[i].lat, dogPts[i].lon, ref.lat, ref.lon);
+    if (d > maxD) { maxD = d; maxIdx = i; }
+  }
+  if (maxIdx >= dogPts.length - 2) return null; // never actually "returns" after the peak
+
+  let cum = 0, endIdx = maxIdx;
+  for (let i = maxIdx + 1; i < dogPts.length; i++) {
+    cum += haversine(dogPts[i - 1].lat, dogPts[i - 1].lon, dogPts[i].lat, dogPts[i].lon);
+    endIdx = i;
+    if (cum >= 20) break;
+  }
+  if (cum < 10) return null; // not enough movement captured to read a bearing from
+
+  const br = bearing(dogPts[maxIdx].lat, dogPts[maxIdx].lon, dogPts[endIdx].lat, dogPts[endIdx].lon);
+  const axisDiff = Math.min(angDiff(br, 0), angDiff(br, 180));
+  return {
+    usingHandler,
+    turnTime: dogPts[maxIdx].t,
+    maxDistFromRef: maxD,
+    runBearing: br,
+    runDistance: cum,
+    axisDiff,
+  };
 }
 
 /* ---------------- storage (IndexedDB) ---------------- */
@@ -218,7 +336,7 @@ function compassSVG(rotDeg, big) {
 }
 
 /* ---------------- app state & routing ---------------- */
-const APP_VERSION = '2026-08-29.6';
+const APP_VERSION = '2026-08-29.7';
 const root = document.getElementById('app-root');
 let state = { hunts: [], newHunt: null };
 
@@ -246,6 +364,7 @@ async function router() {
   if (view === 'new') renderNewHunt();
   else if (view === 'hunt' && payload) renderHuntDetail(payload);
   else if (view === 'hunt3d' && payload) renderHunt3D(payload);
+  else if (view === 'endurance') renderEndurance();
   else renderDashboard();
 }
 window.addEventListener('hashchange', router);
@@ -268,6 +387,7 @@ function renderDashboard() {
       ` : `
         <div class="section-label">Logg</div>
         ${hunts.map(huntCardHTML).join('')}
+        <button class="btn btn-ghost btn-block" id="enduranceBtn" style="margin-top:14px;">Utholdenhet (kritisk hastighet)</button>
       `}
       <div style="margin-top:24px;display:flex;flex-direction:column;gap:8px;">
         ${hunts.length > 0 ? '<button class="btn btn-ghost btn-block" id="exportBtn">Eksporter alle data (backup)</button>' : ''}
@@ -279,6 +399,8 @@ function renderDashboard() {
     <button class="btn btn-primary fab" id="newHuntBtn">+ Ny jakttur</button>
   `;
   document.getElementById('newHuntBtn').onclick = () => navigate('new');
+  const enduranceBtn = document.getElementById('enduranceBtn');
+  if (enduranceBtn) enduranceBtn.onclick = () => navigate('endurance');
   hunts.forEach((h) => {
     const el = document.getElementById('card-' + h.id);
     if (el) el.onclick = () => navigate('hunt', h.id);
@@ -346,9 +468,58 @@ async function exportAllData() {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `kvarter-backup-${new Date().toISOString().slice(0, 10)}.json`;
+  a.download = `gundoghunting-backup-${new Date().toISOString().slice(0, 10)}.json`;
   a.click();
   toast('Backup lastet ned');
+}
+
+/* ---------------- Endurance / critical speed view ---------------- */
+async function renderEndurance() {
+  const hunts = await dbGetAll();
+  const model = computeCriticalSpeedModel(hunts);
+
+  root.innerHTML = `
+    <header class="topbar">
+      <div class="back-row" style="padding:0;">
+        <button class="back-btn" id="backBtn">←</button>
+        <div class="hunt-title">Utholdenhet</div>
+      </div>
+    </header>
+    <main>
+      <p class="note">
+        Kritisk hastighet er farten en hund kan holde uten at utmattelse hoper seg opp —
+        under den grensen er arbeidet i praksis bærekraftig, over den akkumuleres tretthet raskt.
+        Beregnet fra de beste innsatsene på tvers av alle lagrede turer
+        (samme prinsipp som Rozier-Delgado et al. 2025 brukte på jakthunder med GPS-halsbånd,
+        forenklet til en lineær modell for pålitelig beregning i appen).
+      </p>
+      ${model.insufficientData ? `
+        <div class="empty-state">
+          <div class="glyph">📉</div>
+          <h3>Trenger flere turer</h3>
+          <p>Fant ${model.points.length} av ${CS_DURATIONS.length} nødvendige varighetspunkter.
+          Trenger minst 4 for å beregne en pålitelig kurve — logg noen flere turer, gjerne med
+          litt variasjon i intensitet, så dukker dette opp av seg selv.</p>
+        </div>
+      ` : `
+        <div class="stat-grid">
+          <div class="stat-tile"><div class="label">Kritisk hastighet</div><div class="value accent">${(model.CS * 3.6).toFixed(1)} km/t</div></div>
+          <div class="stat-tile"><div class="label">Distansereserve</div><div class="value">${fmt.m(model.Dprime)}</div></div>
+        </div>
+        <p class="note">Basert på ${model.huntsUsed} lagrede ${model.huntsUsed === 1 ? 'tur' : 'turer'}. Blir mer pålitelig jo flere turer med variert intensitet du logger.</p>
+        <div class="section-label">Beste innsats per varighet</div>
+        <div style="display:flex;flex-direction:column;gap:6px;">
+          ${model.points.map((p) => `
+            <div style="display:flex;justify-content:space-between;font-family:var(--font-mono);font-size:13px;padding:8px 12px;background:var(--surface);border-radius:8px;border:1px solid var(--border);">
+              <span style="color:var(--text-muted);">${p.duration < 60 ? p.duration + ' sek' : Math.round(p.duration / 60) + ' min'}</span>
+              <span>${fmt.m(p.distance)} (${((p.distance / p.duration) * 3.6).toFixed(1)} km/t)</span>
+            </div>
+          `).join('')}
+        </div>
+      `}
+    </main>
+  `;
+  document.getElementById('backBtn').onclick = () => navigate('');
 }
 
 /* ---------------- New hunt flow ---------------- */
@@ -544,6 +715,21 @@ async function renderHuntDetail(id) {
         <div class="stat-tile"><div class="label">Varighet</div><div class="value">${fmt.min(stats.durationMin)}</div></div>
         <div class="stat-tile"><div class="label">Bekreftet stand</div><div class="value" style="color:var(--moss)">${stats.stands.length}</div></div>
       </div>
+      <div class="stat-grid" id="elevGrid">
+        <div class="stat-tile"><div class="label">Stigning</div><div class="value" id="elevGainVal">${hunt.elevStats ? fmt.m(hunt.elevStats.gain) : '…'}</div></div>
+        <div class="stat-tile"><div class="label">Fall</div><div class="value" id="elevLossVal">${hunt.elevStats ? fmt.m(hunt.elevStats.loss) : '…'}</div></div>
+      </div>
+      ${stats.homing ? `
+        <div class="section-label">Hjemveisatferd</div>
+        <div class="note">
+          Ved lengste avstand fra ${stats.homing.usingHandler ? 'fører' : 'startpunktet'} (${fmt.m(stats.homing.maxDistFromRef)}, kl ${new Date(stats.homing.turnTime + 2 * 3600000).toISOString().slice(11, 16)})
+          beveget hun seg først i retning ${Math.round(stats.homing.runBearing)}° i ${fmt.m(stats.homing.runDistance)}
+          — det er <b>${Math.round(stats.homing.axisDiff)}°</b> fra nord/sør-aksen.
+          Forskning på jakthunder med GPS-halsbånd har observert et lignende kort "kompassløp" nær nord/sør-retningen idet hunden begynner å orientere seg hjemover.
+          Med kun én tur er ikke dette noe mønster ennå — bare en observasjon å sammenligne med det du selv husker fra turen.
+        </div>
+      ` : ''}
+      <div id="enduranceSlot"></div>
       ${stats.hunterDogDist ? `
         <div class="section-label">Avstand fører–hund</div>
         <div class="stat-grid">
@@ -631,6 +817,67 @@ async function renderHuntDetail(id) {
   }
 
   document.getElementById('view3dBtn').onclick = () => navigate('hunt3d', id);
+
+  // Elevation gain/loss: fetch once, then cache on the hunt record so we
+  // never re-fetch on repeat visits. Same navigate-away guard as the 3D view.
+  if (!hunt.elevStats) {
+    let cancelled = false;
+    window.addEventListener('hashchange', () => { cancelled = true; }, { once: true });
+    (async () => {
+      try {
+        const ds = downsampleArr(stats.dogPts, 90);
+        const elevs = await fetchElevations(ds);
+        if (cancelled) return;
+        const { gain, loss } = elevGainLoss(elevs);
+        hunt.elevStats = { gain: Math.round(gain), loss: Math.round(loss) };
+        await dbPut(hunt);
+        const gainEl = document.getElementById('elevGainVal');
+        const lossEl = document.getElementById('elevLossVal');
+        if (gainEl) gainEl.textContent = fmt.m(gain);
+        if (lossEl) lossEl.textContent = fmt.m(loss);
+      } catch (err) {
+        if (cancelled) return;
+        const gainEl = document.getElementById('elevGainVal');
+        const lossEl = document.getElementById('elevLossVal');
+        if (gainEl) gainEl.textContent = '–';
+        if (lossEl) lossEl.textContent = '–';
+      }
+    })();
+  }
+
+  // Endurance insight: only shown once enough hunts exist to fit a model.
+  (async () => {
+    const allHunts = await dbGetAll();
+    const model = computeCriticalSpeedModel(allHunts);
+    const slot = document.getElementById('enduranceSlot');
+    if (!slot || !model || model.insufficientData) return;
+    const overSec = timeAboveSpeed(stats.dogPts, model.CS * 3.6);
+    slot.innerHTML = `
+      <div class="section-label">Utholdenhet</div>
+      <div class="note">
+        Basert på ${model.huntsUsed} lagrede turer er estimert kritisk hastighet <b>${(model.CS * 3.6).toFixed(1)} km/t</b> —
+        farten der utmattelse begynner å hope seg opp raskt. I denne turen jobbet hun over den grensen i
+        <b>${fmt.min(overSec / 60)}</b> av totalt ${fmt.min(stats.durationMin)}.
+      </div>
+    `;
+  })();
+}
+
+function downsampleArr(arr, target) {
+  if (arr.length <= target) return arr;
+  const step = Math.ceil(arr.length / target);
+  const out = arr.filter((_, i) => i % step === 0);
+  if (out[out.length - 1] !== arr[arr.length - 1]) out.push(arr[arr.length - 1]);
+  return out;
+}
+
+function elevGainLoss(elevations) {
+  let gain = 0, loss = 0;
+  for (let i = 1; i < elevations.length; i++) {
+    const d = elevations[i] - elevations[i - 1];
+    if (d > 0) gain += d; else loss += -d;
+  }
+  return { gain, loss };
 }
 
 /* ---------------- elevation lookup (Terrarium DEM tiles, AWS Open Data — public, no key, used by MapLibre/Mapbox-style tools so reliably CORS-enabled for browser fetches) ---------------- */
