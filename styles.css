@@ -1,0 +1,335 @@
+@import url('https://fonts.googleapis.com/css2?family=Fjalla+One&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
+
+:root {
+  --bg: #131b14;
+  --surface: #1e2a1f;
+  --surface-2: #283624;
+  --border: #33402f;
+  --text: #ede6d6;
+  --text-muted: #93998c;
+  --orange: #e8541e;
+  --orange-dim: #7a3419;
+  --blue: #4c8fbd;
+  --moss: #7a9b6e;
+  --radius: 14px;
+  --font-display: 'Fjalla One', sans-serif;
+  --font-body: 'IBM Plex Sans', sans-serif;
+  --font-mono: 'IBM Plex Mono', monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-body);
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior-y: none;
+}
+
+body {
+  background-image:
+    radial-gradient(ellipse at 20% 0%, rgba(122,155,110,0.08), transparent 55%),
+    repeating-radial-gradient(circle at 85% 15%, transparent 0, transparent 38px, rgba(237,230,214,0.025) 39px, transparent 40px),
+    repeating-radial-gradient(circle at 85% 15%, transparent 0, transparent 78px, rgba(237,230,214,0.02) 79px, transparent 80px);
+  background-attachment: fixed;
+  min-height: 100vh;
+}
+
+button { font-family: var(--font-body); }
+button:focus-visible, a:focus-visible, input:focus-visible, [tabindex]:focus-visible {
+  outline: 2px solid var(--orange);
+  outline-offset: 2px;
+}
+
+.app {
+  max-width: 480px;
+  margin: 0 auto;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---------- Header ---------- */
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: linear-gradient(180deg, var(--bg) 70%, rgba(19,27,20,0));
+  padding: 18px 20px 10px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+}
+.brand {
+  font-family: var(--font-display);
+  font-size: 26px;
+  letter-spacing: 0.02em;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.brand .dot { color: var(--orange); }
+.brand-sub {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+
+main { flex: 1; padding: 4px 20px 100px; }
+
+/* ---------- Buttons ---------- */
+.btn {
+  border: none;
+  border-radius: 10px;
+  padding: 13px 18px;
+  font-family: var(--font-body);
+  font-weight: 600;
+  font-size: 14.5px;
+  cursor: pointer;
+  transition: transform 0.12s ease, background 0.15s ease;
+}
+.btn:active { transform: scale(0.97); }
+.btn-primary { background: var(--orange); color: #1a0d07; }
+.btn-primary:hover { background: #f0642e; }
+.btn-ghost { background: var(--surface-2); color: var(--text); }
+.btn-block { width: 100%; }
+
+.fab {
+  position: fixed;
+  left: 50%;
+  bottom: 22px;
+  transform: translateX(-50%);
+  z-index: 20;
+  width: min(440px, calc(100% - 40px));
+  box-shadow: 0 8px 24px rgba(232,84,30,0.28);
+}
+
+/* ---------- Cards: hunt log entries ---------- */
+.section-label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin: 22px 2px 10px;
+}
+
+.hunt-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  margin-bottom: 12px;
+  cursor: pointer;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px 12px;
+  transition: border-color 0.15s ease;
+}
+.hunt-card:hover { border-color: var(--orange-dim); }
+.hunt-card .date {
+  font-family: var(--font-display);
+  font-size: 19px;
+  grid-column: 1;
+}
+.hunt-card .place {
+  font-size: 12.5px;
+  color: var(--text-muted);
+  grid-column: 1;
+}
+.hunt-card .compass-mini { grid-row: 1 / span 2; grid-column: 2; }
+.hunt-card .stat-row {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 16px;
+  margin-top: 6px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--text);
+  flex-wrap: wrap;
+}
+.hunt-card .stat-row b { color: var(--orange); font-weight: 500; }
+
+.empty-state {
+  text-align: center;
+  padding: 60px 20px;
+  color: var(--text-muted);
+}
+.empty-state .glyph { font-size: 40px; margin-bottom: 10px; opacity: 0.7; }
+.empty-state h3 { font-family: var(--font-display); font-weight: 400; color: var(--text); font-size: 20px; margin: 0 0 6px; }
+.empty-state p { font-size: 13.5px; line-height: 1.5; margin: 0; }
+
+/* ---------- Stat grid ---------- */
+.stat-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin: 14px 0;
+}
+.stat-tile {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px 14px;
+}
+.stat-tile .label {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  margin-bottom: 3px;
+}
+.stat-tile .value {
+  font-family: var(--font-mono);
+  font-size: 21px;
+  color: var(--text);
+}
+.stat-tile .value.accent { color: var(--orange); }
+.stat-tile .value.blue { color: var(--blue); }
+
+/* ---------- Map ---------- */
+#map, #newHuntMap {
+  width: 100%;
+  height: 280px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  margin: 10px 0;
+  background: var(--surface);
+}
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+}
+.legend span { display: flex; align-items: center; gap: 5px; }
+.swatch { width: 14px; height: 3px; border-radius: 2px; display: inline-block; }
+
+/* ---------- New hunt form ---------- */
+.field { margin-bottom: 16px; }
+.field label {
+  display: block;
+  font-size: 12.5px;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+.dropzone {
+  border: 1.5px dashed var(--border);
+  border-radius: 12px;
+  padding: 18px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-muted);
+  cursor: pointer;
+  background: var(--surface);
+  transition: border-color 0.15s ease;
+}
+.dropzone.filled { border-color: var(--moss); color: var(--text); border-style: solid; }
+.dropzone input { display: none; }
+
+.wind-picker {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 14px 16px;
+}
+.wind-picker .compass-wrap { flex-shrink: 0; }
+.wind-dirs {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  flex: 1;
+}
+.wind-dir-btn {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 7px 0;
+  cursor: pointer;
+}
+.wind-dir-btn.active { background: var(--orange); color: #1a0d07; border-color: var(--orange); }
+
+/* ---------- Compass rose (signature element) ---------- */
+.compass {
+  --needle-rot: 0deg;
+  width: 46px; height: 46px;
+  position: relative;
+}
+.compass svg { width: 100%; height: 100%; display: block; }
+.compass .needle {
+  transform-origin: 50% 50%;
+  transform: rotate(var(--needle-rot));
+  transition: transform 0.6s cubic-bezier(.2,.8,.2,1);
+}
+.compass.big { width: 96px; height: 96px; }
+
+/* ---------- Wind breakdown bars ---------- */
+.wind-bars { display: flex; flex-direction: column; gap: 8px; margin: 12px 0; }
+.wind-bar-row { display: flex; align-items: center; gap: 10px; font-size: 12.5px; }
+.wind-bar-row .lbl { width: 88px; flex-shrink: 0; color: var(--text-muted); }
+.wind-bar-track { flex: 1; height: 8px; background: var(--surface-2); border-radius: 4px; overflow: hidden; }
+.wind-bar-fill { height: 100%; border-radius: 4px; }
+.wind-bar-row .pct { width: 38px; text-align: right; font-family: var(--font-mono); flex-shrink: 0; }
+
+/* ---------- Nav / back ---------- */
+.back-row {
+  display: flex; align-items: center; gap: 10px;
+  margin-bottom: 10px;
+}
+.back-btn {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 8px;
+  width: 34px; height: 34px;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.hunt-title { font-family: var(--font-display); font-size: 22px; }
+
+.note {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-top: 6px;
+}
+.note b { color: var(--moss); }
+
+.toast {
+  position: fixed;
+  bottom: 90px; left: 50%; transform: translateX(-50%);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 10px 16px;
+  border-radius: 10px;
+  font-size: 13px;
+  z-index: 30;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.25s ease, transform 0.25s ease;
+}
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(-4px); }
+
+@media (prefers-reduced-motion: reduce) {
+  .compass .needle, .toast { transition: none !important; }
+}
+
+.hidden { display: none !important; }
