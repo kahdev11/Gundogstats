@@ -218,7 +218,7 @@ function compassSVG(rotDeg, big) {
 }
 
 /* ---------------- app state & routing ---------------- */
-const APP_VERSION = '2026-08-29.2';
+const APP_VERSION = '2026-08-29.3';
 const root = document.getElementById('app-root');
 let state = { hunts: [], newHunt: null };
 
@@ -515,10 +515,11 @@ async function renderHuntDetail(id) {
       </div>
     </header>
     <main>
-      <div class="legend">
+      <div class="legend" id="mapLegend">
         <span><span class="swatch" style="background:#e8541e"></span>Fører</span>
         <span><span class="swatch" style="background:#4c8fbd"></span>Hund</span>
         <span><span class="swatch" style="background:#7a9b6e"></span>Stand</span>
+        ${stats.wind ? '<button class="wind-dir-btn" id="windToggleBtn" style="margin-left:auto;">Vis vindretning</button>' : ''}
       </div>
       <div id="map"></div>
       <div class="stat-grid">
@@ -562,49 +563,113 @@ async function renderHuntDetail(id) {
   };
 
   const map = L.map('map', { zoomControl: true, attributionControl: false });
-  const allPts = [];
-  if (stats.wind) {
-    const colors = { upwind: '#4c8fbd', downwind: '#e8541e', cross: '#93998c' };
-    stats.wind.segs.forEach((s) => {
-      L.polyline([s.start, s.end], { color: colors[s.cat], weight: 4, opacity: 0.85 }).addTo(map);
-      allPts.push(s.start, s.end);
-    });
-  } else {
-    const line = stats.dogPts.map((p) => [p.lat, p.lon]);
-    L.polyline(line, { color: '#4c8fbd', weight: 3 }).addTo(map);
-    allPts.push(...line);
-  }
-  if (stats.hunterPts && stats.hunterPts.length > 1) {
-    const hLine = stats.hunterPts.map((p) => [p.lat, p.lon]);
-    L.polyline(hLine, { color: '#e8541e', weight: 3 }).addTo(map);
-    allPts.push(...hLine);
-  }
-  stats.stands.forEach((s) => {
-    L.circleMarker([s.lat, s.lon], { radius: 7, color: '#3b6d11', fillColor: '#7a9b6e', fillOpacity: 1, weight: 2 })
-      .addTo(map)
-      .bindTooltip(`${Math.round((s.end - s.start) / 1000)} sek`);
-  });
-  if (allPts.length) map.fitBounds(allPts);
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+
+  let trackLayer = L.layerGroup().addTo(map);
+  let showWind = false;
+
+  function drawTrack() {
+    trackLayer.clearLayers();
+    const allPts = [];
+    if (showWind && stats.wind) {
+      const colors = { upwind: '#4c8fbd', downwind: '#e8541e', cross: '#93998c' };
+      stats.wind.segs.forEach((s) => {
+        L.polyline([s.start, s.end], { color: colors[s.cat], weight: 4, opacity: 0.9 }).addTo(trackLayer);
+        allPts.push(s.start, s.end);
+      });
+    } else {
+      const line = stats.dogPts.map((p) => [p.lat, p.lon]);
+      L.polyline(line, { color: '#4c8fbd', weight: 3.5, opacity: 0.95 }).addTo(trackLayer);
+      allPts.push(...line);
+    }
+    if (stats.hunterPts && stats.hunterPts.length > 1) {
+      const hLine = stats.hunterPts.map((p) => [p.lat, p.lon]);
+      L.polyline(hLine, { color: '#e8541e', weight: 3, opacity: 0.9 }).addTo(trackLayer);
+      allPts.push(...hLine);
+    }
+    stats.stands.forEach((s) => {
+      L.circleMarker([s.lat, s.lon], { radius: 7, color: '#3b6d11', fillColor: '#7a9b6e', fillOpacity: 1, weight: 2 })
+        .addTo(trackLayer)
+        .bindTooltip(`${Math.round((s.end - s.start) / 1000)} sek`);
+    });
+    if (allPts.length) map.fitBounds(allPts);
+  }
+  drawTrack();
   setTimeout(() => map.invalidateSize(), 0);
   setTimeout(() => map.invalidateSize(), 250);
+
+  const windToggleBtn = document.getElementById('windToggleBtn');
+  if (windToggleBtn) {
+    windToggleBtn.onclick = () => {
+      showWind = !showWind;
+      windToggleBtn.textContent = showWind ? 'Vis sporet' : 'Vis vindretning';
+      windToggleBtn.classList.toggle('active', showWind);
+      drawTrack();
+    };
+  }
 
   document.getElementById('view3dBtn').onclick = () => navigate('hunt3d', id);
 }
 
-/* ---------------- elevation lookup (EU-DEM via Open Topo Data — free, no key, covers Norway) ---------------- */
-async function fetchElevations(latlonPairs) {
-  // Public API limits: max 100 locations/request, 1 req/sec, 1000/day — fine for a single track.
-  const locStr = latlonPairs.map(([lat, lon]) => `${lat.toFixed(6)},${lon.toFixed(6)}`).join('|');
-  const url = `https://api.opentopodata.org/v1/eudem25m?locations=${locStr}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error('Elevation API svarte ' + res.status);
-  const data = await res.json();
-  if (data.status !== 'OK') throw new Error(data.error || 'Ukjent feil fra høyde-API');
-  return data.results.map((r) => (r.elevation == null ? 0 : r.elevation));
+/* ---------------- elevation lookup (Terrarium DEM tiles, AWS Open Data — public, no key, used by MapLibre/Mapbox-style tools so reliably CORS-enabled for browser fetches) ---------------- */
+function lonLatToTile(lon, lat, zoom) {
+  const n = Math.pow(2, zoom);
+  const x = Math.floor(((lon + 180) / 360) * n);
+  const latRad = (lat * Math.PI) / 180;
+  const y = Math.floor(
+    ((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n
+  );
+  return { x, y };
+}
+function lonLatToPixel(lon, lat, zoom, tileX, tileY) {
+  const n = Math.pow(2, zoom);
+  const xTile = ((lon + 180) / 360) * n;
+  const latRad = (lat * Math.PI) / 180;
+  const yTile = ((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n;
+  return {
+    px: Math.floor((xTile - tileX) * 256),
+    py: Math.floor((yTile - tileY) * 256),
+  };
+}
+function loadTileImageData(x, y, z) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      try {
+        const c = document.createElement('canvas');
+        c.width = 256; c.height = 256;
+        const ctx = c.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+        resolve(ctx.getImageData(0, 0, 256, 256));
+      } catch (e) { reject(e); }
+    };
+    img.onerror = () => reject(new Error('Kunne ikke laste terrengflis'));
+    img.src = `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${z}/${x}/${y}.png`;
+  });
+}
+async function fetchElevations(points, zoom = 13) {
+  // Group points by which tile they fall in, so we only fetch each tile once.
+  const tileCache = new Map();
+  const results = [];
+  for (const { lat, lon } of points) {
+    const { x, y } = lonLatToTile(lon, lat, zoom);
+    const key = `${x}/${y}`;
+    if (!tileCache.has(key)) {
+      tileCache.set(key, loadTileImageData(x, y, zoom)); // promise, dedup concurrent loads
+    }
+    const imgData = await tileCache.get(key);
+    const { px, py } = lonLatToPixel(lon, lat, zoom, x, y);
+    const cx = Math.max(0, Math.min(255, px)), cy = Math.max(0, Math.min(255, py));
+    const idx = (cy * 256 + cx) * 4;
+    const r = imgData.data[idx], g = imgData.data[idx + 1], b = imgData.data[idx + 2];
+    const elevation = r * 256 + g + b / 256 - 32768;
+    results.push(elevation);
+  }
+  return results;
 }
 
-/* ---------------- 3D view (real terrenghøyde via EU-DEM) ---------------- */
+/* ---------------- 3D view (real terrenghøyde via Terrarium DEM tiles) ---------------- */
 async function renderHunt3D(id) {
   const db = await openDB();
   const hunt = await new Promise((resolve, reject) => {
@@ -641,11 +706,15 @@ async function renderHunt3D(id) {
       </div>
     </main>
   `;
+  // Guard: if the person navigates away before the (async) elevation fetch
+  // finishes, we must not touch this view's DOM afterward — it's gone.
+  let cancelled = false;
+  const navGuard = () => { cancelled = true; };
+  window.addEventListener('hashchange', navGuard, { once: true });
   document.getElementById('backBtn').onclick = () => navigate('hunt', id);
 
   const statusEl = document.getElementById('three-status');
 
-  // downsample up-front so we only ever need ONE elevation request (API limit: 100 locations)
   function downsample(arr, target) {
     if (arr.length <= target) return arr;
     const step = Math.ceil(arr.length / target);
@@ -659,16 +728,23 @@ async function renderHunt3D(id) {
 
   let elevations = null;
   try {
-    elevations = await fetchElevations(lookupPts.map((p) => [p.lat, p.lon]));
-    statusEl.textContent = 'Terreng fra EU-DEM (Copernicus) — posisjon vist på ekte høyde.';
+    elevations = await fetchElevations(lookupPts);
+    if (cancelled) return;
+    statusEl.textContent = 'Terreng fra åpne høydedata — posisjon vist på ekte høyde.';
   } catch (err) {
-    statusEl.textContent = 'Fikk ikke hentet terrenghøyde akkurat nå (nettverk eller høyde-API utilgjengelig) — viser sporet flatt i stedet.';
+    if (cancelled) return;
+    statusEl.textContent = 'Fikk ikke hentet terrenghøyde akkurat nå (nett eller høydedata utilgjengelig) — viser sporet flatt i stedet.';
   }
+  if (cancelled) return;
 
   const dogElev = elevations ? elevations.slice(0, dogDS.length) : null;
   const standElev = elevations ? elevations.slice(dogDS.length) : null;
 
-  init3D(stats, hunt, { dogDS, dogElev, standElev });
+  try {
+    init3D(stats, hunt, { dogDS, dogElev, standElev });
+  } catch (err) {
+    if (!cancelled) statusEl.textContent = '3D-visning feilet på denne enheten. Prøv igjen, eller se kartet i 2D i stedet.';
+  }
 }
 
 function init3D(stats, hunt, elevData) {
