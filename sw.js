@@ -1,4 +1,4 @@
-const CACHE = 'kvarter-v1';
+const CACHE = 'kvarter-v2';
 const SHELL = [
   './',
   './index.html',
@@ -25,16 +25,19 @@ self.addEventListener('activate', (event) => {
   self.clients.claim();
 });
 
+// Network-first for everything: always try to get the freshest version of the
+// app (and CDN/map/elevation data). Only fall back to the cached copy when
+// there's genuinely no network, so the app still works offline — but an
+// update you've deployed is never hidden behind a stale cache.
 self.addEventListener('fetch', (event) => {
-  const url = new URL(event.request.url);
-  // Always go to network for map tiles and CDN libraries; cache-first for our own shell.
-  if (url.origin !== self.location.origin) {
-    event.respondWith(
-      fetch(event.request).catch(() => caches.match(event.request))
-    );
-    return;
-  }
+  if (event.request.method !== 'GET') return;
   event.respondWith(
-    caches.match(event.request).then((cached) => cached || fetch(event.request))
+    fetch(event.request)
+      .then((response) => {
+        const copy = response.clone();
+        caches.open(CACHE).then((cache) => cache.put(event.request, copy)).catch(() => {});
+        return response;
+      })
+      .catch(() => caches.match(event.request))
   );
 });

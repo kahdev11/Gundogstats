@@ -218,6 +218,7 @@ function compassSVG(rotDeg, big) {
 }
 
 /* ---------------- app state & routing ---------------- */
+const APP_VERSION = '2026-08-29.2';
 const root = document.getElementById('app-root');
 let state = { hunts: [], newHunt: null };
 
@@ -255,7 +256,7 @@ function renderDashboard() {
   root.innerHTML = `
     <header class="topbar">
       <div class="brand"><span>Kvartér</span><span class="dot">·</span></div>
-      <div class="brand-sub">${hunts.length} logget${hunts.length === 1 ? '' : ''}</div>
+      <div class="brand-sub">${hunts.length} logget · v${APP_VERSION}</div>
     </header>
     <main>
       ${hunts.length === 0 ? `
