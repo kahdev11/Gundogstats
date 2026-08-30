@@ -217,6 +217,33 @@ function timeAboveSpeed(pts, speedKmhThreshold) {
   return sec;
 }
 
+const SPEED_BINS = [
+  { label: 'Stille', max: 2 },
+  { label: 'Rolig gange', max: 5 },
+  { label: 'Traving', max: 8 },
+  { label: 'Løping', max: 12 },
+  { label: 'Sprint', max: Infinity },
+];
+function computeSpeedStats(pts) {
+  let maxSpeed = 0;
+  const binSecs = new Array(SPEED_BINS.length).fill(0);
+  for (let i = 1; i < pts.length; i++) {
+    const d = haversine(pts[i - 1].lat, pts[i - 1].lon, pts[i].lat, pts[i].lon);
+    const dt = (pts[i].t - pts[i - 1].t) / 1000;
+    if (dt <= 0) continue;
+    const kmh = (d / dt) * 3.6;
+    if (kmh > maxSpeed) maxSpeed = kmh;
+    let idx = SPEED_BINS.findIndex((b) => kmh <= b.max);
+    if (idx === -1) idx = SPEED_BINS.length - 1;
+    binSecs[idx] += dt;
+  }
+  const total = binSecs.reduce((a, b) => a + b, 0) || 1;
+  return {
+    maxSpeed,
+    bins: SPEED_BINS.map((b, i) => ({ label: b.label, seconds: binSecs[i], pct: (binSecs[i] / total) * 100 })),
+  };
+}
+
 function computeStats(hunt) {
   const dogPts = hunt.dogPts.slice(hunt.trimStart, hunt.trimEnd + 1);
   const hunterPts = hunt.hunterPts ? hunt.hunterPts.filter((p) => p.t >= dogPts[0].t && p.t <= dogPts[dogPts.length - 1].t) : null;
@@ -226,7 +253,8 @@ function computeStats(hunt) {
   const stands = detectStands(dogPts);
   const hd = hunterPts && hunterPts.length > 1 ? hunterDogDistanceStats(hunterPts, dogPts) : null;
   const wind = hunt.windFrom != null ? windSegments(dogPts, COMPASS_DEG[hunt.windFrom]) : null;
-  return { dogPts, hunterPts, dogDist, hunterDist, durationMin, stands, hunterDogDist: hd, wind };
+  const speed = computeSpeedStats(dogPts);
+  return { dogPts, hunterPts, dogDist, hunterDist, durationMin, stands, hunterDogDist: hd, wind, speed };
 }
 
 /* ---------------- storage (IndexedDB) ---------------- */
@@ -305,7 +333,7 @@ function compassSVG(rotDeg, big) {
 }
 
 /* ---------------- app state & routing ---------------- */
-const APP_VERSION = '2026-08-29.12';
+const APP_VERSION = '2026-08-29.13';
 const root = document.getElementById('app-root');
 let state = { hunts: [], newHunt: null };
 
@@ -697,6 +725,17 @@ async function renderHuntDetail(id) {
       <div class="stat-grid" id="elevGrid">
         <div class="stat-tile"><div class="label">Stigning</div><div class="value" id="elevGainVal">${hunt.elevStats ? fmt.m(hunt.elevStats.gain) : '…'}</div></div>
         <div class="stat-tile"><div class="label">Fall</div><div class="value" id="elevLossVal">${hunt.elevStats ? fmt.m(hunt.elevStats.loss) : '…'}</div></div>
+      </div>
+      <div class="section-label">Fart</div>
+      <div class="stat-grid">
+        <div class="stat-tile"><div class="label">Maks fart</div><div class="value accent">${stats.speed.maxSpeed.toFixed(1)} km/t</div></div>
+        <div class="stat-tile"><div class="label">Aktiv tid</div><div class="value">${fmt.min(stats.durationMin)}</div></div>
+      </div>
+      <div class="wind-bars">
+        ${stats.speed.bins.map((b, i) => {
+          const barColors = ['#93998c', '#4c8fbd', '#7a9b6e', '#e8541e', '#c81d4a'];
+          return `<div class="wind-bar-row"><span class="lbl">${b.label}</span><div class="wind-bar-track"><div class="wind-bar-fill" style="width:${b.pct}%;background:${barColors[i]};"></div></div><span class="pct">${fmt.pct(b.pct)}</span></div>`;
+        }).join('')}
       </div>
       <div id="enduranceSlot"></div>
       ${stats.hunterDogDist ? `
@@ -1112,8 +1151,8 @@ async function renderHunt3D(id) {
       <div class="legend" style="padding:0 20px;margin-top:12px;">
         <span id="three-legend-dog"><span class="swatch" style="background:#2fe6c9"></span>Hund</span>
         <span><span class="swatch" style="background:#ede6d6"></span>Fører</span>
-        <span><span class="swatch" style="background:#7a9b6e;border-radius:50%;width:8px;height:8px;"></span>Stand</span>
-        <span><span class="swatch" style="background:#e8b923;border-radius:50%;width:8px;height:8px;"></span>Fuglefunn</span>
+        <span><span class="swatch" style="background:#ff2d78;border-radius:50%;width:8px;height:8px;"></span>Stand</span>
+        <span><span class="swatch" style="background:#7c4dff;border-radius:50%;width:8px;height:8px;"></span>Fuglefunn</span>
         ${stats.wind ? '<button class="wind-dir-btn" id="wind3dToggleBtn" style="margin-left:auto;">Vis vindretning</button>' : ''}
       </div>
       <p class="note" style="margin:10px 20px 0;">Ett: roter. To: zoom/panorer. Høyreklikk-dra (PC): panorer.</p>
@@ -1236,7 +1275,7 @@ function init3D(stats, hunt, elevData) {
   // clearance above the surface so float/interpolation differences between
   // the track's own sampled height and the mesh's blended grid height can
   // never make it dip below and disappear into the ground.
-  const trackR = Math.max(0.55, Math.max(maxX - minX, maxZ - minZ) * 0.0055);
+  const trackR = Math.max(0.35, Math.max(maxX - minX, maxZ - minZ) * 0.0032);
   const terrainClearance = trackR * 2.4;
   function pointAt(i) {
     const [x, z] = project(dogPts[i].lat, dogPts[i].lon);
@@ -1324,6 +1363,8 @@ function init3D(stats, hunt, elevData) {
 
   // Stands, elevated to match the track height at that point, with a thin
   // "pin" line down to the terrain so they're easy to spot from any angle.
+  // Bright magenta — deliberately far from the terrain's green-to-tan hues
+  // and from the track/hunter/bird colours, so it never blends in.
   const markerR = Math.max(1.2, Math.max(maxX - minX, maxZ - minZ) * 0.012);
   stats.stands.forEach((s) => {
     const [x, z] = project(s.lat, s.lon);
@@ -1334,19 +1375,21 @@ function init3D(stats, hunt, elevData) {
     });
     const y = elevY(dogElev ? dogElev[best] : null);
     const geo2 = new THREE.SphereGeometry(markerR, 16, 16);
-    const mat2 = new THREE.MeshBasicMaterial({ color: 0x7a9b6e });
+    const mat2 = new THREE.MeshBasicMaterial({ color: 0xff2d78 });
     const sph = new THREE.Mesh(geo2, mat2);
     sph.position.set(x, y + markerR * 1.6, z);
     scene.add(sph);
-    const poleGeo = new THREE.BufferGeometry();
-    poleGeo.setAttribute('position', new THREE.Float32BufferAttribute([x, y, z, x, y + markerR * 1.6, z], 3));
-    scene.add(new THREE.Line(poleGeo, new THREE.LineBasicMaterial({ color: 0x7a9b6e, transparent: true, opacity: 0.6 })));
+    const poleGeo = new THREE.CylinderGeometry(markerR * 0.12, markerR * 0.12, markerR * 1.6, 8);
+    const poleMat = new THREE.MeshBasicMaterial({ color: 0xb81f56 });
+    const pole = new THREE.Mesh(poleGeo, poleMat);
+    pole.position.set(x, y + (markerR * 1.6) / 2, z);
+    scene.add(pole);
   });
 
-  // Bird sightings — deliberately larger and taller than the stand markers,
-  // with a solid pole (not a hairline), so they read as clear "flags" from
-  // a distance rather than disappearing next to the track and terrain.
-  const birdR = markerR * 1.7;
+  // Bird sightings — a distinct violet, chosen to sit far from every other
+  // colour in the scene (terrain, track, stands, hunter) so it never blends
+  // in. Sized close to the stand markers now, not oversized.
+  const birdR = markerR * 1.15;
   (hunt.birdSightings || []).forEach((b) => {
     const [x, z] = project(b.lat, b.lon);
     let best = 0, bestD = Infinity;
@@ -1355,14 +1398,14 @@ function init3D(stats, hunt, elevData) {
       if (dd < bestD) { bestD = dd; best = i; }
     });
     const y = elevY(dogElev ? dogElev[best] : null);
-    const poleHeight = birdR * 4;
-    const coneGeo = new THREE.ConeGeometry(birdR, birdR * 2.2, 14);
-    const coneMat = new THREE.MeshBasicMaterial({ color: 0xffc933 });
+    const poleHeight = birdR * 2.2;
+    const coneGeo = new THREE.ConeGeometry(birdR, birdR * 1.8, 14);
+    const coneMat = new THREE.MeshBasicMaterial({ color: 0x7c4dff });
     const cone = new THREE.Mesh(coneGeo, coneMat);
-    cone.position.set(x, y + poleHeight + birdR * 1.1, z);
+    cone.position.set(x, y + poleHeight + birdR * 0.9, z);
     scene.add(cone);
     const poleGeo2 = new THREE.CylinderGeometry(birdR * 0.12, birdR * 0.12, poleHeight, 8);
-    const poleMat2 = new THREE.MeshBasicMaterial({ color: 0xc9941f });
+    const poleMat2 = new THREE.MeshBasicMaterial({ color: 0x5a35b8 });
     const pole2 = new THREE.Mesh(poleGeo2, poleMat2);
     pole2.position.set(x, y + poleHeight / 2, z);
     scene.add(pole2);
