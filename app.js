@@ -305,7 +305,7 @@ function compassSVG(rotDeg, big) {
 }
 
 /* ---------------- app state & routing ---------------- */
-const APP_VERSION = '2026-08-29.9';
+const APP_VERSION = '2026-08-29.10';
 const root = document.getElementById('app-root');
 let state = { hunts: [], newHunt: null };
 
@@ -675,9 +675,19 @@ async function renderHuntDetail(id) {
         <span><span class="swatch" style="background:#e8541e"></span>Fører</span>
         <span><span class="swatch" style="background:#4c8fbd"></span>Hund</span>
         <span><span class="swatch" style="background:#7a9b6e"></span>Stand</span>
+        <span><span class="swatch" style="background:#e8b923;border-radius:50%;width:8px;height:8px;"></span>Fuglefunn</span>
         ${stats.wind ? '<button class="wind-dir-btn" id="windToggleBtn" style="margin-left:auto;">Vis vindretning</button>' : ''}
       </div>
       <div id="map"></div>
+      <button class="btn btn-ghost btn-block" id="addBirdBtn" style="margin:8px 0;">+ Fuglefunn</button>
+      <div id="birdPicker" class="hidden" style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px;margin-bottom:10px;">
+        <p style="font-size:12.5px;color:var(--text-muted);margin:0 0 8px;">Hvilken fugl?</p>
+        <div id="birdSpeciesBtns" style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:10px;">
+          ${['Lirype', 'Fjellrype', 'Orrfugl', 'Storfugl', 'Jerpe', 'Annet'].map((s) => `<button type="button" class="wind-dir-btn bird-species-btn" data-species="${s}" style="padding:9px 0;">${s}</button>`).join('')}
+        </div>
+        <input type="text" id="birdNote" placeholder="Notat (valgfritt)" style="width:100%;padding:8px 10px;border-radius:8px;border:1px solid var(--border);background:var(--surface-2);color:var(--text);font-size:13px;margin-bottom:8px;">
+        <button class="btn btn-ghost btn-block" id="birdCancelBtn">Avbryt</button>
+      </div>
       <div class="stat-grid">
         <div class="stat-tile"><div class="label">Hund sporet</div><div class="value blue">${fmt.km(stats.dogDist)}</div></div>
         <div class="stat-tile"><div class="label">Fører gikk</div><div class="value accent">${stats.hunterDist ? fmt.km(stats.hunterDist) : '–'}</div></div>
@@ -753,6 +763,11 @@ async function renderHuntDetail(id) {
         .addTo(trackLayer)
         .bindTooltip(`${Math.round((s.end - s.start) / 1000)} sek`);
     });
+    (hunt.birdSightings || []).forEach((b) => {
+      L.circleMarker([b.lat, b.lon], { radius: 7, color: '#8a6a10', fillColor: '#e8b923', fillOpacity: 1, weight: 2 })
+        .addTo(trackLayer)
+        .bindTooltip(`${b.species}${b.note ? ' — ' + b.note : ''}`);
+    });
     if (allPts.length) map.fitBounds(allPts);
   }
   drawTrack();
@@ -775,6 +790,49 @@ async function renderHuntDetail(id) {
     };
   }
 
+  // Bird sightings: tap "+ Fuglefunn", then tap the map where the bird was found.
+  let awaitingBirdClick = false;
+  let pendingBirdLatLng = null;
+  const addBirdBtn = document.getElementById('addBirdBtn');
+  const birdPicker = document.getElementById('birdPicker');
+  const birdNote = document.getElementById('birdNote');
+  addBirdBtn.onclick = () => {
+    awaitingBirdClick = true;
+    toast('Trykk i kartet der du fant fuglen');
+  };
+  document.getElementById('birdCancelBtn').onclick = () => {
+    birdPicker.classList.add('hidden');
+    awaitingBirdClick = false;
+    pendingBirdLatLng = null;
+    birdNote.value = '';
+  };
+  document.querySelectorAll('.bird-species-btn').forEach((btn) => {
+    btn.onclick = async () => {
+      if (!pendingBirdLatLng) return;
+      const sighting = {
+        id: 'bird-' + Date.now(),
+        lat: pendingBirdLatLng.lat,
+        lon: pendingBirdLatLng.lng,
+        species: btn.dataset.species,
+        note: birdNote.value.trim(),
+        t: Date.now(),
+      };
+      hunt.birdSightings = [...(hunt.birdSightings || []), sighting];
+      await dbPut(hunt);
+      birdPicker.classList.add('hidden');
+      pendingBirdLatLng = null;
+      birdNote.value = '';
+      drawTrack();
+      toast(`${sighting.species} registrert`);
+    };
+  });
+  map.on('click', (e) => {
+    if (!awaitingBirdClick) return;
+    awaitingBirdClick = false;
+    pendingBirdLatLng = e.latlng;
+    birdPicker.classList.remove('hidden');
+  });
+
   document.getElementById('view3dBtn').onclick = () => navigate('hunt3d', id);
 
   // Elevation gain/loss: fetch once, then cache on the hunt record so we
@@ -788,7 +846,7 @@ async function renderHuntDetail(id) {
         if (hasRealElevation(stats.dogPts)) {
           elevs = stats.dogPts.map((p) => p.ele);
         } else {
-          elevs = await fetchElevations(stats.dogPts);
+          elevs = (await fetchElevationsSmart(stats.dogPts)).elevs;
         }
         if (cancelled) return;
         const { gain, loss } = elevGainLoss(elevs);
@@ -913,6 +971,95 @@ async function fetchElevations(points, zoom = 13) {
   if (results.some((e) => e == null)) throw new Error('Terrengdata utilgjengelig for deler av området');
   return results;
 }
+
+/* ---------------- Kartverket høydedata (1 m i kartlagte områder, ellers 20 m — vesentlig
+ * finere enn Terrarium/SRTM sine ~25-30 m). Prøves først; går stille tilbake til
+ * Terrarium-flisene over hvis tjenesten eller antatt parameterformat ikke skulle stemme. */
+function latLonToUTM33(lat, lon) {
+  const a = 6378137.0, f = 1 / 298.257223563, k0 = 0.9996;
+  const e2 = f * (2 - f), ep2 = e2 / (1 - e2);
+  const lon0 = (15 * Math.PI) / 180;
+  const latR = (lat * Math.PI) / 180, lonR = (lon * Math.PI) / 180;
+  const N = a / Math.sqrt(1 - e2 * Math.sin(latR) ** 2);
+  const T = Math.tan(latR) ** 2;
+  const C = ep2 * Math.cos(latR) ** 2;
+  const A = Math.cos(latR) * (lonR - lon0);
+  const M = a * (
+    (1 - e2 / 4 - (3 * e2 * e2) / 64 - (5 * e2 ** 3) / 256) * latR -
+    ((3 * e2) / 8 + (3 * e2 * e2) / 32 + (45 * e2 ** 3) / 1024) * Math.sin(2 * latR) +
+    ((15 * e2 * e2) / 256 + (45 * e2 ** 3) / 1024) * Math.sin(4 * latR) -
+    ((35 * e2 ** 3) / 3072) * Math.sin(6 * latR)
+  );
+  const east = k0 * N * (A + ((1 - T + C) * A ** 3) / 6 + ((5 - 18 * T + T * T + 72 * C - 58 * ep2) * A ** 5) / 120) + 500000;
+  const north = k0 * (M + N * Math.tan(latR) * ((A * A) / 2 + ((5 - T + 9 * C + 4 * C * C) * A ** 4) / 24 + ((61 - 58 * T + T * T + 600 * C - 330 * ep2) * A ** 6) / 720));
+  return { north, east };
+}
+function extractElevationField(data) {
+  const candidates = [
+    data?.punkter?.[0]?.z, data?.punkter?.[0]?.hoyde, data?.punkter?.[0]?.høyde,
+    data?.z, data?.hoyde, data?.høyde, data?.elevation,
+    Array.isArray(data) ? data[0]?.z : undefined,
+    Array.isArray(data) ? data[0]?.hoyde : undefined,
+  ];
+  for (const c of candidates) if (typeof c === 'number' && isFinite(c)) return c;
+  return null;
+}
+async function tryKartverketPoint(lat, lon) {
+  const utm = latLonToUTM33(lat, lon);
+  const url = `https://ws.geonorge.no/hoydedata/v1/punkt?nord=${utm.north.toFixed(1)}&ost=${utm.east.toFixed(1)}&koordsys=25833&geojson=false`;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    return extractElevationField(await res.json());
+  } catch (e) { return null; }
+}
+let kartverketAvailable = null; // null = untested this session
+async function fetchElevationsSmart(points) {
+  if (kartverketAvailable === null) {
+    const mid = points[Math.floor(points.length / 2)];
+    kartverketAvailable = (await tryKartverketPoint(mid.lat, mid.lon)) != null;
+  }
+  if (!kartverketAvailable) {
+    return { source: 'terrarium', elevs: await fetchElevations(points) };
+  }
+  // Sparse sample via the (rate-limited, per-point) Kartverket API, then
+  // linearly interpolate for full track resolution — accurate where it
+  // counts without hammering the service with thousands of requests.
+  const targetSamples = Math.min(70, points.length);
+  const step = Math.max(1, Math.floor(points.length / targetSamples));
+  const sampleIdx = [];
+  for (let i = 0; i < points.length; i += step) sampleIdx.push(i);
+  if (sampleIdx[sampleIdx.length - 1] !== points.length - 1) sampleIdx.push(points.length - 1);
+
+  const sampleElevs = new Array(sampleIdx.length).fill(null);
+  const CHUNK = 8;
+  for (let c = 0; c < sampleIdx.length; c += CHUNK) {
+    const chunk = sampleIdx.slice(c, c + CHUNK);
+    const results = await Promise.all(chunk.map((i) => tryKartverketPoint(points[i].lat, points[i].lon)));
+    results.forEach((z, k) => { sampleElevs[c + k] = z; });
+  }
+  for (let k = 0; k < sampleElevs.length; k++) {
+    if (sampleElevs[k] == null) {
+      let best = null, bestD = Infinity;
+      for (let k2 = 0; k2 < sampleElevs.length; k2++) {
+        if (sampleElevs[k2] != null && Math.abs(k2 - k) < bestD) { bestD = Math.abs(k2 - k); best = sampleElevs[k2]; }
+      }
+      sampleElevs[k] = best ?? 0;
+    }
+  }
+  const full = new Array(points.length).fill(null);
+  sampleIdx.forEach((idx, k) => { full[idx] = sampleElevs[k]; });
+  for (let k = 0; k < sampleIdx.length - 1; k++) {
+    const i0 = sampleIdx[k], i1 = sampleIdx[k + 1];
+    const z0 = full[i0], z1 = full[i1];
+    for (let i = i0 + 1; i < i1; i++) {
+      const f = (i - i0) / (i1 - i0);
+      full[i] = z0 + f * (z1 - z0);
+    }
+  }
+  return { source: 'kartverket', elevs: full };
+}
+
 // Samples a regular lat/lon grid across (and a bit beyond) a bounding box,
 // for building an actual terrain surface rather than just a height-per-point line.
 async function fetchTerrainGrid(minLat, maxLat, minLon, maxLon, gridN = 26, zoom = 13) {
@@ -973,6 +1120,7 @@ async function renderHunt3D(id) {
         `}
         <span><span class="swatch" style="background:#7a9b6e;border-radius:50%;width:8px;height:8px;"></span>Stand</span>
       </div>
+      <p class="note" style="margin:10px 20px 0;">Ett: roter. To: zoom/panorer. Høyreklikk-dra (PC): panorer.</p>
     </main>
   `;
   let cancelled = false;
@@ -993,9 +1141,12 @@ async function renderHunt3D(id) {
       dogElev = dogPts.map((p) => p.ele);
       statusEl.textContent = 'Høyde fra enhetens egen GPS-logg — terrengoverflaten er fra åpne høydedata.';
     } else {
-      dogElev = await fetchElevations(dogPts);
+      const result = await fetchElevationsSmart(dogPts);
+      dogElev = result.elevs;
       if (cancelled) return;
-      statusEl.textContent = 'Terreng og posisjon fra åpne høydedata (Terrarium/SRTM).';
+      statusEl.textContent = result.source === 'kartverket'
+        ? 'Terreng og posisjon fra Kartverkets høydedata (1 m i kartlagte områder).'
+        : 'Terreng og posisjon fra åpne høydedata (Terrarium/SRTM).';
     }
     terrain = await fetchTerrainGrid(bbox.minLat, bbox.maxLat, bbox.minLon, bbox.maxLon);
     if (cancelled) return;
@@ -1136,7 +1287,9 @@ function init3D(stats, hunt, elevData) {
     scene.add(new THREE.Line(hGeo, hMat));
   }
 
-  // Stands, elevated to match the track height at that point.
+  // Stands, elevated to match the track height at that point, with a thin
+  // "pin" line down to the terrain so they're easy to spot from any angle.
+  const markerR = Math.max(1.2, Math.max(maxX - minX, maxZ - minZ) * 0.012);
   stats.stands.forEach((s) => {
     const [x, z] = project(s.lat, s.lon);
     let best = 0, bestD = Infinity;
@@ -1145,11 +1298,33 @@ function init3D(stats, hunt, elevData) {
       if (dd < bestD) { bestD = dd; best = i; }
     });
     const y = elevY(dogElev ? dogElev[best] : null);
-    const geo2 = new THREE.SphereGeometry(0.9, 16, 16);
+    const geo2 = new THREE.SphereGeometry(markerR, 16, 16);
     const mat2 = new THREE.MeshBasicMaterial({ color: 0x7a9b6e });
     const sph = new THREE.Mesh(geo2, mat2);
-    sph.position.set(x, y + 1.2, z);
+    sph.position.set(x, y + markerR * 1.6, z);
     scene.add(sph);
+    const poleGeo = new THREE.BufferGeometry();
+    poleGeo.setAttribute('position', new THREE.Float32BufferAttribute([x, y, z, x, y + markerR * 1.6, z], 3));
+    scene.add(new THREE.Line(poleGeo, new THREE.LineBasicMaterial({ color: 0x7a9b6e, transparent: true, opacity: 0.6 })));
+  });
+
+  // Bird sightings, as a distinct amber cone (vs. the green stand spheres).
+  (hunt.birdSightings || []).forEach((b) => {
+    const [x, z] = project(b.lat, b.lon);
+    let best = 0, bestD = Infinity;
+    dogPts.forEach((dp, i) => {
+      const dd = haversine(b.lat, b.lon, dp.lat, dp.lon);
+      if (dd < bestD) { bestD = dd; best = i; }
+    });
+    const y = elevY(dogElev ? dogElev[best] : null);
+    const coneGeo = new THREE.ConeGeometry(markerR, markerR * 2.2, 12);
+    const coneMat = new THREE.MeshBasicMaterial({ color: 0xe8b923 });
+    const cone = new THREE.Mesh(coneGeo, coneMat);
+    cone.position.set(x, y + markerR * 2.2, z);
+    scene.add(cone);
+    const poleGeo2 = new THREE.BufferGeometry();
+    poleGeo2.setAttribute('position', new THREE.Float32BufferAttribute([x, y, z, x, y + markerR * 1.1, z], 3));
+    scene.add(new THREE.Line(poleGeo2, new THREE.LineBasicMaterial({ color: 0xe8b923, transparent: true, opacity: 0.6 })));
   });
 
   const spanX = Math.max(maxX - minX, 50), spanZ = Math.max(maxZ - minZ, 50);
@@ -1167,8 +1342,8 @@ function init3D(stats, hunt, elevData) {
   renderer.setSize(W(), H());
 
   let azimuth = Math.PI * 0.25, elevAngle = 0.55, radius = radius0;
-  let dragging = false, lastX = 0, lastY = 0, idleTimer = null, autoRotate = true;
-  let pinchStartDist = null, pinchStartRadius = null;
+  let dragging = false, panning = false, lastX = 0, lastY = 0, idleTimer = null, autoRotate = true;
+  let pinchStartDist = null, pinchStartRadius = null, pinchLastMidX = null, pinchLastMidY = null;
 
   function setCamera() {
     const cy = Math.sin(elevAngle) * radius;
@@ -1182,6 +1357,17 @@ function init3D(stats, hunt, elevData) {
     radius = Math.max(MIN_RADIUS, Math.min(MAX_RADIUS, radius * factor));
     setCamera();
   }
+  // Pan moves the look-at point itself, in the camera's current left/right
+  // and up/down screen directions — so you can settle the view on one
+  // specific spot instead of only ever orbiting the track's centre.
+  function panBy(dxPx, dyPx) {
+    const panScale = radius * 0.0016;
+    const rightX = Math.sin(azimuth), rightZ = -Math.cos(azimuth);
+    target.x += -dxPx * panScale * rightX;
+    target.z += -dxPx * panScale * rightZ;
+    target.y += dyPx * panScale;
+    setCamera();
+  }
   function onDown(x, y) { dragging = true; lastX = x; lastY = y; autoRotate = false; clearTimeout(idleTimer); }
   function onMove(x, y) {
     if (!dragging) return;
@@ -1191,12 +1377,21 @@ function init3D(stats, hunt, elevData) {
     lastX = x; lastY = y;
     setCamera();
   }
-  function onWindowMouseMove(e) { onMove(e.clientX, e.clientY); }
-  function onUp() { dragging = false; pinchStartDist = null; idleTimer = setTimeout(() => { autoRotate = true; }, 2500); }
+  function onWindowMouseMove(e) {
+    if (panning) { panBy(e.clientX - lastX, e.clientY - lastY); lastX = e.clientX; lastY = e.clientY; return; }
+    onMove(e.clientX, e.clientY);
+  }
+  function onUp() {
+    dragging = false; panning = false; pinchStartDist = null;
+    idleTimer = setTimeout(() => { autoRotate = true; }, 2500);
+  }
   function onWheel(e) { zoomBy(1 + e.deltaY * 0.001); e.preventDefault(); }
   function touchDist(touches) {
     const dx = touches[0].clientX - touches[1].clientX, dy = touches[0].clientY - touches[1].clientY;
     return Math.hypot(dx, dy);
+  }
+  function touchMid(touches) {
+    return { x: (touches[0].clientX + touches[1].clientX) / 2, y: (touches[0].clientY + touches[1].clientY) / 2 };
   }
   function onTouchStart(e) {
     autoRotate = false; clearTimeout(idleTimer);
@@ -1204,20 +1399,30 @@ function init3D(stats, hunt, elevData) {
       dragging = false;
       pinchStartDist = touchDist(e.touches);
       pinchStartRadius = radius;
+      const mid = touchMid(e.touches);
+      pinchLastMidX = mid.x; pinchLastMidY = mid.y;
     } else if (e.touches.length === 1) {
       onDown(e.touches[0].clientX, e.touches[0].clientY);
     }
   }
   function onTouchMove(e) {
     if (e.touches.length === 2 && pinchStartDist != null) {
+      // Two fingers: pinch distance zooms, midpoint movement pans — both at once, as expected.
       const d = touchDist(e.touches);
       radius = Math.max(MIN_RADIUS, Math.min(MAX_RADIUS, pinchStartRadius * (pinchStartDist / d)));
+      const mid = touchMid(e.touches);
+      panBy(mid.x - pinchLastMidX, mid.y - pinchLastMidY);
+      pinchLastMidX = mid.x; pinchLastMidY = mid.y;
       setCamera();
     } else if (e.touches.length === 1) {
       onMove(e.touches[0].clientX, e.touches[0].clientY);
     }
   }
-  canvas.addEventListener('mousedown', (e) => onDown(e.clientX, e.clientY));
+  canvas.addEventListener('mousedown', (e) => {
+    if (e.button === 2) { panning = true; lastX = e.clientX; lastY = e.clientY; autoRotate = false; clearTimeout(idleTimer); }
+    else onDown(e.clientX, e.clientY);
+  });
+  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
   window.addEventListener('mousemove', onWindowMouseMove);
   window.addEventListener('mouseup', onUp);
   canvas.addEventListener('touchstart', onTouchStart, { passive: true });
