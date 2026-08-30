@@ -305,7 +305,7 @@ function compassSVG(rotDeg, big) {
 }
 
 /* ---------------- app state & routing ---------------- */
-const APP_VERSION = '2026-08-29.11';
+const APP_VERSION = '2026-08-29.12';
 const root = document.getElementById('app-root');
 let state = { hunts: [], newHunt: null };
 
@@ -1110,16 +1110,11 @@ async function renderHunt3D(id) {
         </div>
       </div>
       <div class="legend" style="padding:0 20px;margin-top:12px;">
-        ${stats.wind ? `
-          <span><span class="swatch" style="background:#4c8fbd"></span>Mot vind</span>
-          <span><span class="swatch" style="background:#e8541e"></span>Med vind</span>
-          <span><span class="swatch" style="background:#93998c"></span>På tvers</span>
-        ` : `
-          <span><span class="swatch" style="background:#2fe6c9"></span>Hund</span>
-        `}
+        <span id="three-legend-dog"><span class="swatch" style="background:#2fe6c9"></span>Hund</span>
         <span><span class="swatch" style="background:#ede6d6"></span>Fører</span>
         <span><span class="swatch" style="background:#7a9b6e;border-radius:50%;width:8px;height:8px;"></span>Stand</span>
         <span><span class="swatch" style="background:#e8b923;border-radius:50%;width:8px;height:8px;"></span>Fuglefunn</span>
+        ${stats.wind ? '<button class="wind-dir-btn" id="wind3dToggleBtn" style="margin-left:auto;">Vis vindretning</button>' : ''}
       </div>
       <p class="note" style="margin:10px 20px 0;">Ett: roter. To: zoom/panorer. Høyreklikk-dra (PC): panorer.</p>
     </main>
@@ -1241,7 +1236,7 @@ function init3D(stats, hunt, elevData) {
   // clearance above the surface so float/interpolation differences between
   // the track's own sampled height and the mesh's blended grid height can
   // never make it dip below and disappear into the ground.
-  const trackR = Math.max(0.9, Math.max(maxX - minX, maxZ - minZ) * 0.01);
+  const trackR = Math.max(0.55, Math.max(maxX - minX, maxZ - minZ) * 0.0055);
   const terrainClearance = trackR * 2.4;
   function pointAt(i) {
     const [x, z] = project(dogPts[i].lat, dogPts[i].lon);
@@ -1250,33 +1245,55 @@ function init3D(stats, hunt, elevData) {
     minZ = Math.min(minZ, z); maxZ = Math.max(maxZ, z);
     return new THREE.Vector3(x, y, z);
   }
-  function addTube(idxs, radius, color, opacity) {
-    if (idxs.length < 2) return;
-    const pts3 = idxs.map(pointAt);
-    const curve = new THREE.CatmullRomCurve3(pts3);
-    const tubularSegments = Math.max(2, Math.min(400, idxs.length * 2));
-    const tgeo = new THREE.TubeGeometry(curve, tubularSegments, radius, 6, false);
-    const tmat = new THREE.MeshBasicMaterial({ color, transparent: opacity < 1, opacity });
-    scene.add(new THREE.Mesh(tgeo, tmat));
-  }
-
-  if (catForIdx) {
-    const catHex = { upwind: 0x4c8fbd, downwind: 0xe8541e, cross: 0x93998c };
-    let curCat = catForIdx[0], curIdxs = [0];
-    for (let i = 1; i < dogPts.length; i++) {
-      if (catForIdx[i] !== curCat) {
-        curIdxs.push(i); // shared point so adjacent tubes join with no visible gap
-        addTube(curIdxs, trackR, catHex[curCat], 1);
-        curCat = catForIdx[i];
-        curIdxs = [i];
-      } else curIdxs.push(i);
+  const dogTrackGroup = new THREE.Group();
+  scene.add(dogTrackGroup);
+  function buildDogTrack(useWind) {
+    while (dogTrackGroup.children.length) dogTrackGroup.remove(dogTrackGroup.children[0]);
+    function addTube(idxs, radius, color, opacity) {
+      if (idxs.length < 2) return;
+      const pts3 = idxs.map(pointAt);
+      const curve = new THREE.CatmullRomCurve3(pts3);
+      const tubularSegments = Math.max(2, Math.min(400, idxs.length * 2));
+      const tgeo = new THREE.TubeGeometry(curve, tubularSegments, radius, 6, false);
+      const tmat = new THREE.MeshBasicMaterial({ color, transparent: opacity < 1, opacity });
+      dogTrackGroup.add(new THREE.Mesh(tgeo, tmat));
     }
-    addTube(curIdxs, trackR, catHex[curCat], 1);
-  } else {
-    // A single vivid, high-contrast colour (not the muted blue/orange used
-    // elsewhere) so the whole track stands out clearly against the terrain
-    // mesh's green-to-tan palette regardless of viewing angle.
-    addTube(dogPts.map((_, i) => i), trackR, 0x2fe6c9, 1);
+    if (useWind && catForIdx) {
+      const catHex = { upwind: 0x4c8fbd, downwind: 0xe8541e, cross: 0x93998c };
+      let curCat = catForIdx[0], curIdxs = [0];
+      for (let i = 1; i < dogPts.length; i++) {
+        if (catForIdx[i] !== curCat) {
+          curIdxs.push(i); // shared point so adjacent tubes join with no visible gap
+          addTube(curIdxs, trackR, catHex[curCat], 1);
+          curCat = catForIdx[i];
+          curIdxs = [i];
+        } else curIdxs.push(i);
+      }
+      addTube(curIdxs, trackR, catHex[curCat], 1);
+    } else {
+      // A single vivid, high-contrast colour (not the muted blue/orange used
+      // elsewhere) so the whole track stands out clearly against the terrain
+      // mesh's green-to-tan palette regardless of viewing angle.
+      addTube(dogPts.map((_, i) => i), trackR, 0x2fe6c9, 1);
+    }
+  }
+  let showWind3D = false;
+  buildDogTrack(showWind3D);
+  const wind3dBtn = document.getElementById('wind3dToggleBtn');
+  const legend3d = document.getElementById('three-legend-dog');
+  if (wind3dBtn) {
+    wind3dBtn.onclick = () => {
+      showWind3D = !showWind3D;
+      buildDogTrack(showWind3D);
+      wind3dBtn.textContent = showWind3D ? 'Vis spor' : 'Vis vindretning';
+      if (legend3d) {
+        legend3d.innerHTML = showWind3D
+          ? `<span><span class="swatch" style="background:#4c8fbd"></span>Mot vind</span>
+             <span><span class="swatch" style="background:#e8541e"></span>Med vind</span>
+             <span><span class="swatch" style="background:#93998c"></span>På tvers</span>`
+          : `<span><span class="swatch" style="background:#2fe6c9"></span>Hund</span>`;
+      }
+    };
   }
 
   // Hunter track, draped using the nearest dog-track elevation as a proxy.
@@ -1326,7 +1343,10 @@ function init3D(stats, hunt, elevData) {
     scene.add(new THREE.Line(poleGeo, new THREE.LineBasicMaterial({ color: 0x7a9b6e, transparent: true, opacity: 0.6 })));
   });
 
-  // Bird sightings, as a distinct amber cone (vs. the green stand spheres).
+  // Bird sightings — deliberately larger and taller than the stand markers,
+  // with a solid pole (not a hairline), so they read as clear "flags" from
+  // a distance rather than disappearing next to the track and terrain.
+  const birdR = markerR * 1.7;
   (hunt.birdSightings || []).forEach((b) => {
     const [x, z] = project(b.lat, b.lon);
     let best = 0, bestD = Infinity;
@@ -1335,14 +1355,17 @@ function init3D(stats, hunt, elevData) {
       if (dd < bestD) { bestD = dd; best = i; }
     });
     const y = elevY(dogElev ? dogElev[best] : null);
-    const coneGeo = new THREE.ConeGeometry(markerR, markerR * 2.2, 12);
-    const coneMat = new THREE.MeshBasicMaterial({ color: 0xe8b923 });
+    const poleHeight = birdR * 4;
+    const coneGeo = new THREE.ConeGeometry(birdR, birdR * 2.2, 14);
+    const coneMat = new THREE.MeshBasicMaterial({ color: 0xffc933 });
     const cone = new THREE.Mesh(coneGeo, coneMat);
-    cone.position.set(x, y + markerR * 2.2, z);
+    cone.position.set(x, y + poleHeight + birdR * 1.1, z);
     scene.add(cone);
-    const poleGeo2 = new THREE.BufferGeometry();
-    poleGeo2.setAttribute('position', new THREE.Float32BufferAttribute([x, y, z, x, y + markerR * 1.1, z], 3));
-    scene.add(new THREE.Line(poleGeo2, new THREE.LineBasicMaterial({ color: 0xe8b923, transparent: true, opacity: 0.6 })));
+    const poleGeo2 = new THREE.CylinderGeometry(birdR * 0.12, birdR * 0.12, poleHeight, 8);
+    const poleMat2 = new THREE.MeshBasicMaterial({ color: 0xc9941f });
+    const pole2 = new THREE.Mesh(poleGeo2, poleMat2);
+    pole2.position.set(x, y + poleHeight / 2, z);
+    scene.add(pole2);
   });
 
   const spanX = Math.max(maxX - minX, 50), spanZ = Math.max(maxZ - minZ, 50);
