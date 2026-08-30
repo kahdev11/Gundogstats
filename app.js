@@ -305,7 +305,7 @@ function compassSVG(rotDeg, big) {
 }
 
 /* ---------------- app state & routing ---------------- */
-const APP_VERSION = '2026-08-29.10';
+const APP_VERSION = '2026-08-29.11';
 const root = document.getElementById('app-root');
 let state = { hunts: [], newHunt: null };
 
@@ -1115,10 +1115,11 @@ async function renderHunt3D(id) {
           <span><span class="swatch" style="background:#e8541e"></span>Med vind</span>
           <span><span class="swatch" style="background:#93998c"></span>På tvers</span>
         ` : `
-          <span><span class="swatch" style="background:#4c8fbd"></span>Rolig</span>
-          <span><span class="swatch" style="background:#e8541e"></span>Høy fart</span>
+          <span><span class="swatch" style="background:#2fe6c9"></span>Hund</span>
         `}
+        <span><span class="swatch" style="background:#ede6d6"></span>Fører</span>
         <span><span class="swatch" style="background:#7a9b6e;border-radius:50%;width:8px;height:8px;"></span>Stand</span>
+        <span><span class="swatch" style="background:#e8b923;border-radius:50%;width:8px;height:8px;"></span>Fuglefunn</span>
       </div>
       <p class="note" style="margin:10px 20px 0;">Ett: roter. To: zoom/panorer. Høyreklikk-dra (PC): panorer.</p>
     </main>
@@ -1129,7 +1130,6 @@ async function renderHunt3D(id) {
   const statusEl = document.getElementById('three-status');
 
   const dogPts = stats.dogPts; // FULL resolution — real device data, not smoothed down
-  const usingDeviceElev = hasRealElevation(dogPts);
 
   const lats = dogPts.map((p) => p.lat), lons = dogPts.map((p) => p.lon);
   if (stats.hunterPts) { stats.hunterPts.forEach((p) => { lats.push(p.lat); lons.push(p.lon); }); }
@@ -1137,17 +1137,18 @@ async function renderHunt3D(id) {
 
   let dogElev = null, terrain = null;
   try {
-    if (usingDeviceElev) {
-      dogElev = dogPts.map((p) => p.ele);
-      statusEl.textContent = 'Høyde fra enhetens egen GPS-logg — terrengoverflaten er fra åpne høydedata.';
-    } else {
-      const result = await fetchElevationsSmart(dogPts);
-      dogElev = result.elevs;
-      if (cancelled) return;
-      statusEl.textContent = result.source === 'kartverket'
-        ? 'Terreng og posisjon fra Kartverkets høydedata (1 m i kartlagte områder).'
-        : 'Terreng og posisjon fra åpne høydedata (Terrarium/SRTM).';
-    }
+    // Always sample the track's height from the SAME terrain source used to
+    // build the ground mesh below (rather than the GPX device elevation,
+    // which even when present can differ from the mesh by enough to make
+    // the track dip below the surface here and there). One consistent
+    // source guarantees the track and the terrain never disagree — and
+    // Kartverket's data is high-resolution across Norway anyway.
+    const result = await fetchElevationsSmart(dogPts);
+    dogElev = result.elevs;
+    if (cancelled) return;
+    statusEl.textContent = result.source === 'kartverket'
+      ? 'Terreng og posisjon fra Kartverkets høydedata (1 m i kartlagte områder).'
+      : 'Terreng og posisjon fra åpne høydedata (Terrarium/SRTM).';
     terrain = await fetchTerrainGrid(bbox.minLat, bbox.maxLat, bbox.minLon, bbox.maxLon);
     if (cancelled) return;
   } catch (err) {
@@ -1183,18 +1184,6 @@ function init3D(stats, hunt, elevData) {
   const minElev = allElevs.length ? Math.min(...allElevs) : 0;
   const elevY = (e) => (e == null ? 0 : (e - minElev) * VERTICAL_EXAGGERATION);
 
-  const speeds = [0];
-  for (let i = 1; i < dogPts.length; i++) {
-    const d = haversine(dogPts[i - 1].lat, dogPts[i - 1].lon, dogPts[i].lat, dogPts[i].lon);
-    const dt = (dogPts[i].t - dogPts[i - 1].t) / 1000;
-    speeds.push(dt > 0 ? Math.min((d / dt) * 3.6, 25) : 0);
-  }
-  const colorFor = (i) => {
-    const frac = Math.min(speeds[i] / 12, 1);
-    const c1 = new THREE.Color(0x4c8fbd), c2 = new THREE.Color(0xe8541e);
-    return c1.clone().lerp(c2, frac);
-  };
-
   let catForIdx = null;
   if (stats.wind) {
     catForIdx = dogPts.map((p) => {
@@ -1206,7 +1195,6 @@ function init3D(stats, hunt, elevData) {
       return best || 'cross';
     });
   }
-  const catColors = { upwind: 0x4c8fbd, downwind: 0xe8541e, cross: 0x93998c };
 
   const scene = new THREE.Scene();
 
@@ -1248,43 +1236,73 @@ function init3D(stats, hunt, elevData) {
     scene.add(new THREE.Mesh(tgeo, tmat));
   }
 
-  // Dog track — full GPS resolution, draped a little above the terrain so it
-  // doesn't z-fight with the surface underneath it.
-  const positions = [];
-  const colors = [];
-  dogPts.forEach((p, i) => {
-    const [x, z] = project(p.lat, p.lon);
-    const y = elevY(dogElev ? dogElev[i] : null) + 0.6;
-    positions.push(x, y, z);
-    const col = catForIdx ? new THREE.Color(catColors[catForIdx[i]]) : colorFor(i);
-    colors.push(col.r, col.g, col.b);
+  // Dog track — full GPS resolution, rendered as an actual solid tube (not a
+  // hairline) so it reads clearly against the terrain, and lifted a fixed
+  // clearance above the surface so float/interpolation differences between
+  // the track's own sampled height and the mesh's blended grid height can
+  // never make it dip below and disappear into the ground.
+  const trackR = Math.max(0.9, Math.max(maxX - minX, maxZ - minZ) * 0.01);
+  const terrainClearance = trackR * 2.4;
+  function pointAt(i) {
+    const [x, z] = project(dogPts[i].lat, dogPts[i].lon);
+    const y = elevY(dogElev ? dogElev[i] : null) + terrainClearance;
     minX = Math.min(minX, x); maxX = Math.max(maxX, x);
     minZ = Math.min(minZ, z); maxZ = Math.max(maxZ, z);
-  });
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-  geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
-  const mat = new THREE.LineBasicMaterial({ vertexColors: true, linewidth: 2 });
-  scene.add(new THREE.Line(geo, mat));
+    return new THREE.Vector3(x, y, z);
+  }
+  function addTube(idxs, radius, color, opacity) {
+    if (idxs.length < 2) return;
+    const pts3 = idxs.map(pointAt);
+    const curve = new THREE.CatmullRomCurve3(pts3);
+    const tubularSegments = Math.max(2, Math.min(400, idxs.length * 2));
+    const tgeo = new THREE.TubeGeometry(curve, tubularSegments, radius, 6, false);
+    const tmat = new THREE.MeshBasicMaterial({ color, transparent: opacity < 1, opacity });
+    scene.add(new THREE.Mesh(tgeo, tmat));
+  }
+
+  if (catForIdx) {
+    const catHex = { upwind: 0x4c8fbd, downwind: 0xe8541e, cross: 0x93998c };
+    let curCat = catForIdx[0], curIdxs = [0];
+    for (let i = 1; i < dogPts.length; i++) {
+      if (catForIdx[i] !== curCat) {
+        curIdxs.push(i); // shared point so adjacent tubes join with no visible gap
+        addTube(curIdxs, trackR, catHex[curCat], 1);
+        curCat = catForIdx[i];
+        curIdxs = [i];
+      } else curIdxs.push(i);
+    }
+    addTube(curIdxs, trackR, catHex[curCat], 1);
+  } else {
+    // A single vivid, high-contrast colour (not the muted blue/orange used
+    // elsewhere) so the whole track stands out clearly against the terrain
+    // mesh's green-to-tan palette regardless of viewing angle.
+    addTube(dogPts.map((_, i) => i), trackR, 0x2fe6c9, 1);
+  }
 
   // Hunter track, draped using the nearest dog-track elevation as a proxy.
   if (stats.hunterPts && stats.hunterPts.length > 1 && dogElev) {
-    const hPos = [];
-    stats.hunterPts.forEach((p) => {
-      const [x, z] = project(p.lat, p.lon);
+    const hIdxToDogIdx = stats.hunterPts.map((p) => {
       let best = 0, bestD = Infinity;
       dogPts.forEach((dp, i) => {
         const dd = haversine(p.lat, p.lon, dp.lat, dp.lon);
         if (dd < bestD) { bestD = dd; best = i; }
       });
-      hPos.push(x, elevY(dogElev[best]) + 0.9, z);
+      return best;
+    });
+    const hPts3 = stats.hunterPts.map((p, k) => {
+      const [x, z] = project(p.lat, p.lon);
+      const y = elevY(dogElev[hIdxToDogIdx[k]]) + terrainClearance * 1.4;
       minX = Math.min(minX, x); maxX = Math.max(maxX, x);
       minZ = Math.min(minZ, z); maxZ = Math.max(maxZ, z);
+      return new THREE.Vector3(x, y, z);
     });
-    const hGeo = new THREE.BufferGeometry();
-    hGeo.setAttribute('position', new THREE.Float32BufferAttribute(hPos, 3));
-    const hMat = new THREE.LineBasicMaterial({ color: 0xede6d6, transparent: true, opacity: 0.7 });
-    scene.add(new THREE.Line(hGeo, hMat));
+    if (hPts3.length >= 2) {
+      const hCurve = new THREE.CatmullRomCurve3(hPts3);
+      const hSeg = Math.max(2, Math.min(400, hPts3.length * 2));
+      const hGeo = new THREE.TubeGeometry(hCurve, hSeg, trackR * 0.55, 6, false);
+      const hMat = new THREE.MeshBasicMaterial({ color: 0xede6d6, transparent: true, opacity: 0.85 });
+      scene.add(new THREE.Mesh(hGeo, hMat));
+    }
   }
 
   // Stands, elevated to match the track height at that point, with a thin
