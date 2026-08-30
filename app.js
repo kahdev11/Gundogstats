@@ -333,7 +333,7 @@ function compassSVG(rotDeg, big) {
 }
 
 /* ---------------- app state & routing ---------------- */
-const APP_VERSION = '2026-08-29.13';
+const APP_VERSION = '2026-08-29.14';
 const root = document.getElementById('app-root');
 let state = { hunts: [], newHunt: null };
 
@@ -362,6 +362,7 @@ async function router() {
   else if (view === 'hunt' && payload) renderHuntDetail(payload);
   else if (view === 'hunt3d' && payload) renderHunt3D(payload);
   else if (view === 'endurance') renderEndurance();
+  else if (view === 'compare') renderCompare();
   else renderDashboard();
 }
 window.addEventListener('hashchange', router);
@@ -385,6 +386,7 @@ function renderDashboard() {
         <div class="section-label">Logg</div>
         ${hunts.map(huntCardHTML).join('')}
         <button class="btn btn-ghost btn-block" id="enduranceBtn" style="margin-top:14px;">Utholdenhet (kritisk hastighet)</button>
+        ${hunts.length >= 2 ? '<button class="btn btn-ghost btn-block" id="compareBtn" style="margin-top:8px;">Sammenlign turer</button>' : ''}
       `}
       <div style="margin-top:24px;display:flex;flex-direction:column;gap:8px;">
         ${hunts.length > 0 ? '<button class="btn btn-ghost btn-block" id="exportBtn">Eksporter alle data (backup)</button>' : ''}
@@ -398,6 +400,8 @@ function renderDashboard() {
   document.getElementById('newHuntBtn').onclick = () => navigate('new');
   const enduranceBtn = document.getElementById('enduranceBtn');
   if (enduranceBtn) enduranceBtn.onclick = () => navigate('endurance');
+  const compareBtn = document.getElementById('compareBtn');
+  if (compareBtn) compareBtn.onclick = () => navigate('compare');
   hunts.forEach((h) => {
     const el = document.getElementById('card-' + h.id);
     if (el) el.onclick = () => navigate('hunt', h.id);
@@ -517,6 +521,88 @@ async function renderEndurance() {
     </main>
   `;
   document.getElementById('backBtn').onclick = () => navigate('');
+}
+
+/* ---------------- Compare hunts over time ---------------- */
+function miniBarChart(label, entries, fmtFn, colorHex) {
+  const max = Math.max(...entries.map((e) => e.value), 0.0001);
+  return `
+    <div class="section-label">${label}</div>
+    <div style="display:flex;align-items:flex-end;gap:5px;height:90px;padding:0 2px;">
+      ${entries.map((e) => `
+        <div style="flex:1;min-width:0;display:flex;flex-direction:column;align-items:center;height:100%;justify-content:flex-end;">
+          <span style="font-size:9.5px;color:var(--text);font-family:var(--font-mono);margin-bottom:3px;white-space:nowrap;">${e.value > 0 ? fmtFn(e.value) : ''}</span>
+          <div style="width:100%;background:${colorHex};border-radius:3px 3px 0 0;height:${Math.max(2, (e.value / max) * 62)}px;"></div>
+          <span style="font-size:9px;color:var(--text-muted);margin-top:4px;">${e.dateLabel}</span>
+        </div>
+      `).join('')}
+    </div>
+  `;
+}
+
+async function renderCompare() {
+  const allHunts = await dbGetAll();
+  const chronological = [...allHunts].sort((a, b) => a.date.localeCompare(b.date));
+
+  root.innerHTML = `
+    <header class="topbar">
+      <div class="back-row" style="padding:0;">
+        <button class="back-btn" id="backBtn">←</button>
+        <div class="hunt-title">Sammenlign turer</div>
+      </div>
+    </header>
+    <main>
+      <p class="note">Velg hvilke turer som skal være med. Vises i kronologisk rekkefølge, eldst til venstre.</p>
+      <div id="huntCheckboxes" style="display:flex;flex-direction:column;gap:6px;margin:10px 0 18px;max-height:180px;overflow-y:auto;">
+        ${chronological.map((h) => `
+          <label style="display:flex;align-items:center;gap:8px;font-size:13px;padding:6px 2px;">
+            <input type="checkbox" class="hunt-check" data-id="${h.id}" checked style="width:16px;height:16px;">
+            <span>${fmt.date(h.date)}${h.name ? ' — ' + h.name : ''}</span>
+          </label>
+        `).join('')}
+      </div>
+      <div id="compareCharts"></div>
+    </main>
+  `;
+  document.getElementById('backBtn').onclick = () => navigate('');
+
+  function draw() {
+    const selectedIds = new Set(
+      Array.from(document.querySelectorAll('.hunt-check:checked')).map((el) => el.dataset.id)
+    );
+    const selected = chronological.filter((h) => selectedIds.has(h.id));
+    const slot = document.getElementById('compareCharts');
+    if (selected.length < 2) {
+      slot.innerHTML = `<div class="empty-state"><p>Velg minst to turer for å sammenligne.</p></div>`;
+      return;
+    }
+    const rows = selected.map((h) => {
+      const s = computeStats(h);
+      const highIntensityPct = s.speed.bins
+        .filter((b) => b.label === 'Løping' || b.label === 'Sprint')
+        .reduce((a, b) => a + b.pct, 0);
+      const dateLabel = new Date(h.date).toLocaleDateString('nb-NO', { day: 'numeric', month: 'short' });
+      return {
+        dateLabel,
+        dogDist: s.dogDist / 1000,
+        maxSpeed: s.speed.maxSpeed,
+        highIntensityPct,
+        stands: s.stands.length,
+        elevGain: h.elevStats ? h.elevStats.gain : 0,
+      };
+    });
+    const missingElev = selected.some((h) => !h.elevStats);
+    slot.innerHTML = `
+      ${miniBarChart('Distanse hund (km)', rows.map((r) => ({ dateLabel: r.dateLabel, value: r.dogDist })), (v) => v.toFixed(1), '#4c8fbd')}
+      ${miniBarChart('Maks fart (km/t)', rows.map((r) => ({ dateLabel: r.dateLabel, value: r.maxSpeed })), (v) => v.toFixed(0), '#e8541e')}
+      ${miniBarChart('Høy intensitet (%)', rows.map((r) => ({ dateLabel: r.dateLabel, value: r.highIntensityPct })), (v) => Math.round(v) + '%', '#c81d4a')}
+      ${miniBarChart('Bekreftet stand', rows.map((r) => ({ dateLabel: r.dateLabel, value: r.stands })), (v) => Math.round(v), '#7a9b6e')}
+      ${miniBarChart('Stigning (m)', rows.map((r) => ({ dateLabel: r.dateLabel, value: r.elevGain })), (v) => Math.round(v), '#b99b6b')}
+      ${missingElev ? '<p class="note">Noen turer mangler høydedata ennå — besøk turen (fanen med kart) én gang så beregnes den og vises her neste gang.</p>' : ''}
+    `;
+  }
+  document.querySelectorAll('.hunt-check').forEach((el) => { el.onchange = draw; });
+  draw();
 }
 
 /* ---------------- New hunt flow ---------------- */
