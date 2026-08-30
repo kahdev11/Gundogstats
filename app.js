@@ -32,10 +32,19 @@ function parseGPX(text) {
     const lon = parseFloat(tp.getAttribute('lon'));
     const timeEl = tp.getElementsByTagName('time')[0];
     const t = timeEl ? new Date(timeEl.textContent).getTime() : null;
-    return { lat, lon, t };
+    const eleEl = tp.getElementsByTagName('ele')[0];
+    const ele = eleEl ? parseFloat(eleEl.textContent) : null;
+    return { lat, lon, t, ele: isNaN(ele) ? null : ele };
   }).filter((p) => !isNaN(p.lat) && !isNaN(p.lon) && p.t !== null);
   pts.sort((a, b) => a.t - b.t);
   return pts;
+}
+// True if at least most points actually carry a real device elevation reading,
+// so we can prefer it over looking anything up.
+function hasRealElevation(pts) {
+  if (!pts || !pts.length) return false;
+  const withEle = pts.filter((p) => p.ele != null && !isNaN(p.ele)).length;
+  return withEle / pts.length > 0.9;
 }
 
 /* ---------------- track math ---------------- */
@@ -217,47 +226,7 @@ function computeStats(hunt) {
   const stands = detectStands(dogPts);
   const hd = hunterPts && hunterPts.length > 1 ? hunterDogDistanceStats(hunterPts, dogPts) : null;
   const wind = hunt.windFrom != null ? windSegments(dogPts, COMPASS_DEG[hunt.windFrom]) : null;
-  const homing = detectHomingRun(dogPts, hunterPts);
-  return { dogPts, hunterPts, dogDist, hunterDist, durationMin, stands, hunterDogDist: hd, wind, homing };
-}
-
-/* ---------------- homing behaviour ("compass run") ----------------
- * Based on Nováková et al. 2020 (dogs equipped with GPS collars): when a
- * hunting dog returns via a NEW route rather than retracing its outbound
- * path, it often opens the return with a short (~20 m) run aligned close
- * to the north–south geomagnetic axis before turning toward the handler.
- * This looks for that specific signature: the point of maximum distance
- * from the handler (or the start point if no handler track), then the
- * bearing of the next ~20 m of movement from there. */
-function detectHomingRun(dogPts, hunterPts) {
-  if (dogPts.length < 5) return null;
-  const usingHandler = !!(hunterPts && hunterPts.length > 1);
-  const ref = usingHandler ? hunterPts[hunterPts.length - 1] : dogPts[0];
-  let maxD = -1, maxIdx = 0;
-  for (let i = 0; i < dogPts.length; i++) {
-    const d = haversine(dogPts[i].lat, dogPts[i].lon, ref.lat, ref.lon);
-    if (d > maxD) { maxD = d; maxIdx = i; }
-  }
-  if (maxIdx >= dogPts.length - 2) return null; // never actually "returns" after the peak
-
-  let cum = 0, endIdx = maxIdx;
-  for (let i = maxIdx + 1; i < dogPts.length; i++) {
-    cum += haversine(dogPts[i - 1].lat, dogPts[i - 1].lon, dogPts[i].lat, dogPts[i].lon);
-    endIdx = i;
-    if (cum >= 20) break;
-  }
-  if (cum < 10) return null; // not enough movement captured to read a bearing from
-
-  const br = bearing(dogPts[maxIdx].lat, dogPts[maxIdx].lon, dogPts[endIdx].lat, dogPts[endIdx].lon);
-  const axisDiff = Math.min(angDiff(br, 0), angDiff(br, 180));
-  return {
-    usingHandler,
-    turnTime: dogPts[maxIdx].t,
-    maxDistFromRef: maxD,
-    runBearing: br,
-    runDistance: cum,
-    axisDiff,
-  };
+  return { dogPts, hunterPts, dogDist, hunterDist, durationMin, stands, hunterDogDist: hd, wind };
 }
 
 /* ---------------- storage (IndexedDB) ---------------- */
@@ -336,7 +305,7 @@ function compassSVG(rotDeg, big) {
 }
 
 /* ---------------- app state & routing ---------------- */
-const APP_VERSION = '2026-08-29.7';
+const APP_VERSION = '2026-08-29.9';
 const root = document.getElementById('app-root');
 let state = { hunts: [], newHunt: null };
 
@@ -719,16 +688,6 @@ async function renderHuntDetail(id) {
         <div class="stat-tile"><div class="label">Stigning</div><div class="value" id="elevGainVal">${hunt.elevStats ? fmt.m(hunt.elevStats.gain) : '…'}</div></div>
         <div class="stat-tile"><div class="label">Fall</div><div class="value" id="elevLossVal">${hunt.elevStats ? fmt.m(hunt.elevStats.loss) : '…'}</div></div>
       </div>
-      ${stats.homing ? `
-        <div class="section-label">Hjemveisatferd</div>
-        <div class="note">
-          Ved lengste avstand fra ${stats.homing.usingHandler ? 'fører' : 'startpunktet'} (${fmt.m(stats.homing.maxDistFromRef)}, kl ${new Date(stats.homing.turnTime + 2 * 3600000).toISOString().slice(11, 16)})
-          beveget hun seg først i retning ${Math.round(stats.homing.runBearing)}° i ${fmt.m(stats.homing.runDistance)}
-          — det er <b>${Math.round(stats.homing.axisDiff)}°</b> fra nord/sør-aksen.
-          Forskning på jakthunder med GPS-halsbånd har observert et lignende kort "kompassløp" nær nord/sør-retningen idet hunden begynner å orientere seg hjemover.
-          Med kun én tur er ikke dette noe mønster ennå — bare en observasjon å sammenligne med det du selv husker fra turen.
-        </div>
-      ` : ''}
       <div id="enduranceSlot"></div>
       ${stats.hunterDogDist ? `
         <div class="section-label">Avstand fører–hund</div>
@@ -825,8 +784,12 @@ async function renderHuntDetail(id) {
     window.addEventListener('hashchange', () => { cancelled = true; }, { once: true });
     (async () => {
       try {
-        const ds = downsampleArr(stats.dogPts, 90);
-        const elevs = await fetchElevations(ds);
+        let elevs;
+        if (hasRealElevation(stats.dogPts)) {
+          elevs = stats.dogPts.map((p) => p.ele);
+        } else {
+          elevs = await fetchElevations(stats.dogPts);
+        }
         if (cancelled) return;
         const { gain, loss } = elevGainLoss(elevs);
         hunt.elevStats = { gain: Math.round(gain), loss: Math.round(loss) };
@@ -917,28 +880,61 @@ function loadTileImageData(x, y, z) {
     img.src = `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${z}/${x}/${y}.png`;
   });
 }
-async function fetchElevations(points, zoom = 13) {
-  // Group points by which tile they fall in, so we only fetch each tile once.
-  const tileCache = new Map();
-  const results = [];
-  for (const { lat, lon } of points) {
+// Loading a handful of DEM tiles is the only network cost — once cached,
+// decoding elevation for any number of lat/lon points is just pixel math,
+// so there is no reason to cap how many track points get real terrain
+// height (unlike the old per-request JSON API this replaced).
+async function ensureTilesLoaded(latlonPairs, zoom, tileCache) {
+  const needed = new Map();
+  latlonPairs.forEach(([lat, lon]) => {
     const { x, y } = lonLatToTile(lon, lat, zoom);
-    const key = `${x}/${y}`;
-    if (!tileCache.has(key)) {
-      tileCache.set(key, loadTileImageData(x, y, zoom)); // promise, dedup concurrent loads
-    }
-    const imgData = await tileCache.get(key);
-    const { px, py } = lonLatToPixel(lon, lat, zoom, x, y);
-    const cx = Math.max(0, Math.min(255, px)), cy = Math.max(0, Math.min(255, py));
-    const idx = (cy * 256 + cx) * 4;
-    const r = imgData.data[idx], g = imgData.data[idx + 1], b = imgData.data[idx + 2];
-    const elevation = r * 256 + g + b / 256 - 32768;
-    results.push(elevation);
-  }
+    needed.set(`${x}/${y}`, { x, y });
+  });
+  await Promise.all([...needed.entries()].map(async ([key, { x, y }]) => {
+    if (tileCache.has(key)) return;
+    try { tileCache.set(key, await loadTileImageData(x, y, zoom)); }
+    catch (e) { tileCache.set(key, null); }
+  }));
+}
+function decodeElevAt(lat, lon, zoom, tileCache) {
+  const { x, y } = lonLatToTile(lon, lat, zoom);
+  const imgData = tileCache.get(`${x}/${y}`);
+  if (!imgData) return null;
+  const { px, py } = lonLatToPixel(lon, lat, zoom, x, y);
+  const cx = Math.max(0, Math.min(255, px)), cy = Math.max(0, Math.min(255, py));
+  const idx = (cy * 256 + cx) * 4;
+  const r = imgData.data[idx], g = imgData.data[idx + 1], b = imgData.data[idx + 2];
+  return r * 256 + g + b / 256 - 32768;
+}
+async function fetchElevations(points, zoom = 13) {
+  const tileCache = new Map();
+  await ensureTilesLoaded(points.map((p) => [p.lat, p.lon]), zoom, tileCache);
+  const results = points.map((p) => decodeElevAt(p.lat, p.lon, zoom, tileCache));
+  if (results.some((e) => e == null)) throw new Error('Terrengdata utilgjengelig for deler av området');
   return results;
 }
+// Samples a regular lat/lon grid across (and a bit beyond) a bounding box,
+// for building an actual terrain surface rather than just a height-per-point line.
+async function fetchTerrainGrid(minLat, maxLat, minLon, maxLon, gridN = 26, zoom = 13) {
+  const marginLat = (maxLat - minLat) * 0.25 || 0.001;
+  const marginLon = (maxLon - minLon) * 0.25 || 0.001;
+  minLat -= marginLat; maxLat += marginLat;
+  minLon -= marginLon; maxLon += marginLon;
+  const cells = [];
+  for (let i = 0; i < gridN; i++) {
+    for (let j = 0; j < gridN; j++) {
+      const lat = minLat + ((maxLat - minLat) * i) / (gridN - 1);
+      const lon = minLon + ((maxLon - minLon) * j) / (gridN - 1);
+      cells.push({ lat, lon });
+    }
+  }
+  const tileCache = new Map();
+  await ensureTilesLoaded(cells.map((c) => [c.lat, c.lon]), zoom, tileCache);
+  const grid = cells.map((c) => ({ ...c, elev: decodeElevAt(c.lat, c.lon, zoom, tileCache) }));
+  return { gridN, grid };
+}
 
-/* ---------------- 3D view (real terrenghøyde via Terrarium DEM tiles) ---------------- */
+/* ---------------- 3D view (real terrenghøyde: enhetens egen GPX-høyde om den finnes, ellers åpne terrengdata) ---------------- */
 async function renderHunt3D(id) {
   const db = await openDB();
   const hunt = await new Promise((resolve, reject) => {
@@ -958,9 +954,13 @@ async function renderHunt3D(id) {
       </div>
     </header>
     <main style="padding-left:0;padding-right:0;">
-      <div id="three-status" class="note" style="margin:0 20px 10px;">Henter terrenghøyde for området …</div>
+      <div id="three-status" class="note" style="margin:0 20px 10px;">Henter terreng for området …</div>
       <div id="three-wrap" style="width:100%;height:60vh;min-height:360px;position:relative;background:radial-gradient(ellipse at 50% 20%, #1c2a1d, #0d130e);">
         <canvas id="three-canvas" style="display:block;width:100%;height:100%;touch-action:none;"></canvas>
+        <div style="position:absolute;right:10px;bottom:10px;display:flex;flex-direction:column;gap:6px;">
+          <button id="zoomInBtn" style="width:38px;height:38px;border-radius:10px;border:1px solid var(--border);background:rgba(30,42,31,0.85);color:var(--text);font-size:18px;">+</button>
+          <button id="zoomOutBtn" style="width:38px;height:38px;border-radius:10px;border:1px solid var(--border);background:rgba(30,42,31,0.85);color:var(--text);font-size:18px;">−</button>
+        </div>
       </div>
       <div class="legend" style="padding:0 20px;margin-top:12px;">
         ${stats.wind ? `
@@ -975,42 +975,38 @@ async function renderHunt3D(id) {
       </div>
     </main>
   `;
-  // Guard: if the person navigates away before the (async) elevation fetch
-  // finishes, we must not touch this view's DOM afterward — it's gone.
   let cancelled = false;
-  const navGuard = () => { cancelled = true; };
-  window.addEventListener('hashchange', navGuard, { once: true });
+  window.addEventListener('hashchange', () => { cancelled = true; }, { once: true });
   document.getElementById('backBtn').onclick = () => navigate('hunt', id);
-
   const statusEl = document.getElementById('three-status');
 
-  function downsample(arr, target) {
-    if (arr.length <= target) return arr;
-    const step = Math.ceil(arr.length / target);
-    const out = arr.filter((_, i) => i % step === 0);
-    if (out[out.length - 1] !== arr[arr.length - 1]) out.push(arr[arr.length - 1]);
-    return out;
-  }
-  const dogDS = downsample(stats.dogPts, 90);
-  const standPts = stats.stands.map((s) => ({ lat: s.lat, lon: s.lon }));
-  const lookupPts = [...dogDS, ...standPts];
+  const dogPts = stats.dogPts; // FULL resolution — real device data, not smoothed down
+  const usingDeviceElev = hasRealElevation(dogPts);
 
-  let elevations = null;
+  const lats = dogPts.map((p) => p.lat), lons = dogPts.map((p) => p.lon);
+  if (stats.hunterPts) { stats.hunterPts.forEach((p) => { lats.push(p.lat); lons.push(p.lon); }); }
+  const bbox = { minLat: Math.min(...lats), maxLat: Math.max(...lats), minLon: Math.min(...lons), maxLon: Math.max(...lons) };
+
+  let dogElev = null, terrain = null;
   try {
-    elevations = await fetchElevations(lookupPts);
+    if (usingDeviceElev) {
+      dogElev = dogPts.map((p) => p.ele);
+      statusEl.textContent = 'Høyde fra enhetens egen GPS-logg — terrengoverflaten er fra åpne høydedata.';
+    } else {
+      dogElev = await fetchElevations(dogPts);
+      if (cancelled) return;
+      statusEl.textContent = 'Terreng og posisjon fra åpne høydedata (Terrarium/SRTM).';
+    }
+    terrain = await fetchTerrainGrid(bbox.minLat, bbox.maxLat, bbox.minLon, bbox.maxLon);
     if (cancelled) return;
-    statusEl.textContent = 'Terreng fra åpne høydedata — posisjon vist på ekte høyde.';
   } catch (err) {
     if (cancelled) return;
-    statusEl.textContent = 'Fikk ikke hentet terrenghøyde akkurat nå (nett eller høydedata utilgjengelig) — viser sporet flatt i stedet.';
+    statusEl.textContent = 'Fikk ikke hentet terreng akkurat nå (nett eller høydedata utilgjengelig) — viser sporet flatt i stedet.';
   }
   if (cancelled) return;
 
-  const dogElev = elevations ? elevations.slice(0, dogDS.length) : null;
-  const standElev = elevations ? elevations.slice(dogDS.length) : null;
-
   try {
-    init3D(stats, hunt, { dogDS, dogElev, standElev });
+    init3D(stats, hunt, { dogPts, dogElev, terrain });
   } catch (err) {
     if (!cancelled) statusEl.textContent = '3D-visning feilet på denne enheten. Prøv igjen, eller se kartet i 2D i stedet.';
   }
@@ -1020,35 +1016,26 @@ function init3D(stats, hunt, elevData) {
   const canvas = document.getElementById('three-canvas');
   const wrap = document.getElementById('three-wrap');
   const W = () => wrap.clientWidth, H = () => wrap.clientHeight;
-  const { dogDS, dogElev, standElev } = elevData;
+  const { dogPts, dogElev, terrain } = elevData;
 
-  // project lat/lon to local meters around the track's centroid
-  const lat0 = dogDS[Math.floor(dogDS.length / 2)].lat;
-  const lon0 = dogDS[Math.floor(dogDS.length / 2)].lon;
+  const lat0 = dogPts[Math.floor(dogPts.length / 2)].lat;
+  const lon0 = dogPts[Math.floor(dogPts.length / 2)].lon;
   const mPerLat = 111320;
   const mPerLon = 111320 * Math.cos(toRad(lat0));
-  const project = (p) => [
-    (p.lon - lon0) * mPerLon,
-    (p.lat - lat0) * mPerLat,
-  ];
-
-  function downsample(arr, target) {
-    if (arr.length <= target) return arr;
-    const step = Math.ceil(arr.length / target);
-    const out = arr.filter((_, i) => i % step === 0);
-    if (out[out.length - 1] !== arr[arr.length - 1]) out.push(arr[arr.length - 1]);
-    return out;
-  }
+  const project = (lat, lon) => [(lon - lon0) * mPerLon, (lat - lat0) * mPerLat];
 
   const VERTICAL_EXAGGERATION = 1.8;
-  const minElev = dogElev ? Math.min(...dogElev) : 0;
-  const elevY = (i) => (dogElev ? (dogElev[i] - minElev) * VERTICAL_EXAGGERATION : 0);
+  const allElevs = [
+    ...(dogElev || []),
+    ...(terrain ? terrain.grid.map((g) => g.elev).filter((e) => e != null) : []),
+  ];
+  const minElev = allElevs.length ? Math.min(...allElevs) : 0;
+  const elevY = (e) => (e == null ? 0 : (e - minElev) * VERTICAL_EXAGGERATION);
 
-  // speed per point — used for color when there's no wind classification
   const speeds = [0];
-  for (let i = 1; i < dogDS.length; i++) {
-    const d = haversine(dogDS[i - 1].lat, dogDS[i - 1].lon, dogDS[i].lat, dogDS[i].lon);
-    const dt = (dogDS[i].t - dogDS[i - 1].t) / 1000;
+  for (let i = 1; i < dogPts.length; i++) {
+    const d = haversine(dogPts[i - 1].lat, dogPts[i - 1].lon, dogPts[i].lat, dogPts[i].lon);
+    const dt = (dogPts[i].t - dogPts[i - 1].t) / 1000;
     speeds.push(dt > 0 ? Math.min((d / dt) * 3.6, 25) : 0);
   }
   const colorFor = (i) => {
@@ -1059,7 +1046,7 @@ function init3D(stats, hunt, elevData) {
 
   let catForIdx = null;
   if (stats.wind) {
-    catForIdx = dogDS.map((p) => {
+    catForIdx = dogPts.map((p) => {
       let best = null, bestD = Infinity;
       stats.wind.segs.forEach((s) => {
         const dmid = haversine(p.lat, p.lon, (s.start[0] + s.end[0]) / 2, (s.start[1] + s.end[1]) / 2);
@@ -1070,116 +1057,177 @@ function init3D(stats, hunt, elevData) {
   }
   const catColors = { upwind: 0x4c8fbd, downwind: 0xe8541e, cross: 0x93998c };
 
-  // build geometry
+  const scene = new THREE.Scene();
+
+  // Terrain surface: a real triangulated mesh with vertex height from open
+  // elevation data, colored low (moss) to high (warm tan) — not just a line
+  // floating in space.
+  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+  if (terrain) {
+    const n = terrain.gridN;
+    const positions = [];
+    const colors = [];
+    const terrainElevs = terrain.grid.map((g) => g.elev).filter((e) => e != null);
+    const tMin = Math.min(...terrainElevs), tMax = Math.max(...terrainElevs) || tMin + 1;
+    const low = new THREE.Color(0x2e4a30), high = new THREE.Color(0xb99b6b);
+    terrain.grid.forEach((g) => {
+      const [x, z] = project(g.lat, g.lon);
+      const e = g.elev == null ? tMin : g.elev;
+      const y = elevY(e);
+      positions.push(x, y, z);
+      const frac = tMax > tMin ? (e - tMin) / (tMax - tMin) : 0;
+      const col = low.clone().lerp(high, frac);
+      colors.push(col.r, col.g, col.b);
+      minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+      minZ = Math.min(minZ, z); maxZ = Math.max(maxZ, z);
+    });
+    const indices = [];
+    for (let i = 0; i < n - 1; i++) {
+      for (let j = 0; j < n - 1; j++) {
+        const a = i * n + j, b = i * n + j + 1, c = (i + 1) * n + j, d = (i + 1) * n + j + 1;
+        indices.push(a, c, b, b, c, d);
+      }
+    }
+    const tgeo = new THREE.BufferGeometry();
+    tgeo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    tgeo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+    tgeo.setIndex(indices);
+    tgeo.computeVertexNormals();
+    const tmat = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide });
+    scene.add(new THREE.Mesh(tgeo, tmat));
+  }
+
+  // Dog track — full GPS resolution, draped a little above the terrain so it
+  // doesn't z-fight with the surface underneath it.
   const positions = [];
   const colors = [];
-  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
-  dogDS.forEach((p, i) => {
-    const [x, z] = project(p);
-    const y = elevY(i);
+  dogPts.forEach((p, i) => {
+    const [x, z] = project(p.lat, p.lon);
+    const y = elevY(dogElev ? dogElev[i] : null) + 0.6;
     positions.push(x, y, z);
     const col = catForIdx ? new THREE.Color(catColors[catForIdx[i]]) : colorFor(i);
     colors.push(col.r, col.g, col.b);
     minX = Math.min(minX, x); maxX = Math.max(maxX, x);
     minZ = Math.min(minZ, z); maxZ = Math.max(maxZ, z);
   });
-
-  const scene = new THREE.Scene();
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
   geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
   const mat = new THREE.LineBasicMaterial({ vertexColors: true, linewidth: 2 });
-  const line = new THREE.Line(geo, mat);
-  scene.add(line);
+  scene.add(new THREE.Line(geo, mat));
 
-  // hunter track: projected onto the same terrain profile via nearest dog-point elevation
+  // Hunter track, draped using the nearest dog-track elevation as a proxy.
   if (stats.hunterPts && stats.hunterPts.length > 1 && dogElev) {
-    const hDS = downsample(stats.hunterPts, 250);
     const hPos = [];
-    hDS.forEach((p) => {
-      const [x, z] = project(p);
+    stats.hunterPts.forEach((p) => {
+      const [x, z] = project(p.lat, p.lon);
       let best = 0, bestD = Infinity;
-      dogDS.forEach((dp, i) => {
+      dogPts.forEach((dp, i) => {
         const dd = haversine(p.lat, p.lon, dp.lat, dp.lon);
         if (dd < bestD) { bestD = dd; best = i; }
       });
-      hPos.push(x, elevY(best) + 0.4, z);
+      hPos.push(x, elevY(dogElev[best]) + 0.9, z);
+      minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+      minZ = Math.min(minZ, z); maxZ = Math.max(maxZ, z);
     });
     const hGeo = new THREE.BufferGeometry();
     hGeo.setAttribute('position', new THREE.Float32BufferAttribute(hPos, 3));
-    const hMat = new THREE.LineBasicMaterial({ color: 0xede6d6, transparent: true, opacity: 0.6 });
+    const hMat = new THREE.LineBasicMaterial({ color: 0xede6d6, transparent: true, opacity: 0.7 });
     scene.add(new THREE.Line(hGeo, hMat));
   }
 
-  // stands as small glowing spheres, on the real terrain height
-  stats.stands.forEach((s, i) => {
-    const [x, z] = project(s);
-    const y = standElev ? (standElev[i] - minElev) * VERTICAL_EXAGGERATION : 0;
+  // Stands, elevated to match the track height at that point.
+  stats.stands.forEach((s) => {
+    const [x, z] = project(s.lat, s.lon);
+    let best = 0, bestD = Infinity;
+    dogPts.forEach((dp, i) => {
+      const dd = haversine(s.lat, s.lon, dp.lat, dp.lon);
+      if (dd < bestD) { bestD = dd; best = i; }
+    });
+    const y = elevY(dogElev ? dogElev[best] : null);
     const geo2 = new THREE.SphereGeometry(0.9, 16, 16);
     const mat2 = new THREE.MeshBasicMaterial({ color: 0x7a9b6e });
     const sph = new THREE.Mesh(geo2, mat2);
-    sph.position.set(x, y + 0.9, z);
+    sph.position.set(x, y + 1.2, z);
     scene.add(sph);
   });
 
-  // ground grid at base elevation
   const spanX = Math.max(maxX - minX, 50), spanZ = Math.max(maxZ - minZ, 50);
-  const gridSize = Math.max(spanX, spanZ) * 1.4;
-  const grid = new THREE.GridHelper(gridSize, 24, 0x33402f, 0x232f21);
-  grid.position.set((minX + maxX) / 2, 0, (minZ + maxZ) / 2);
-  scene.add(grid);
-
-  const maxY = dogElev ? Math.max(...dogElev.map((_, i) => elevY(i))) : 0;
   const centerX = (minX + maxX) / 2, centerZ = (minZ + maxZ) / 2;
-  const target = new THREE.Vector3(centerX, maxY / 2 + 2, centerZ);
+  const maxElevSeen = allElevs.length ? (Math.max(...allElevs) - minElev) * VERTICAL_EXAGGERATION : 0;
+  const target = new THREE.Vector3(centerX, maxElevSeen / 2 + 2, centerZ);
+  const gridSize = Math.max(spanX, spanZ) * 1.4;
   const radius0 = Math.max(spanX, spanZ) * 0.9 + 40;
+  const MIN_RADIUS = Math.max(spanX, spanZ) * 0.08 + 5;
+  const MAX_RADIUS = radius0 * 4;
 
-  const camera = new THREE.PerspectiveCamera(52, W() / H(), 0.1, gridSize * 4);
+  const camera = new THREE.PerspectiveCamera(52, W() / H(), 0.1, gridSize * 6 + 1000);
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
   renderer.setSize(W(), H());
 
-  let azimuth = Math.PI * 0.25, elevation = 0.55, radius = radius0;
+  let azimuth = Math.PI * 0.25, elevAngle = 0.55, radius = radius0;
   let dragging = false, lastX = 0, lastY = 0, idleTimer = null, autoRotate = true;
+  let pinchStartDist = null, pinchStartRadius = null;
 
   function setCamera() {
-    const cy = Math.sin(elevation) * radius;
-    const ch = Math.cos(elevation) * radius;
-    camera.position.set(
-      target.x + Math.cos(azimuth) * ch,
-      target.y + cy,
-      target.z + Math.sin(azimuth) * ch
-    );
+    const cy = Math.sin(elevAngle) * radius;
+    const ch = Math.cos(elevAngle) * radius;
+    camera.position.set(target.x + Math.cos(azimuth) * ch, target.y + cy, target.z + Math.sin(azimuth) * ch);
     camera.lookAt(target);
   }
   setCamera();
 
+  function zoomBy(factor) {
+    radius = Math.max(MIN_RADIUS, Math.min(MAX_RADIUS, radius * factor));
+    setCamera();
+  }
   function onDown(x, y) { dragging = true; lastX = x; lastY = y; autoRotate = false; clearTimeout(idleTimer); }
   function onMove(x, y) {
     if (!dragging) return;
     const dx = x - lastX, dy = y - lastY;
     azimuth -= dx * 0.006;
-    elevation = Math.max(0.12, Math.min(1.4, elevation + dy * 0.005));
+    elevAngle = Math.max(0.08, Math.min(1.5, elevAngle + dy * 0.005));
     lastX = x; lastY = y;
     setCamera();
   }
   function onWindowMouseMove(e) { onMove(e.clientX, e.clientY); }
-  function onUp() {
-    dragging = false;
-    idleTimer = setTimeout(() => { autoRotate = true; }, 2500);
+  function onUp() { dragging = false; pinchStartDist = null; idleTimer = setTimeout(() => { autoRotate = true; }, 2500); }
+  function onWheel(e) { zoomBy(1 + e.deltaY * 0.001); e.preventDefault(); }
+  function touchDist(touches) {
+    const dx = touches[0].clientX - touches[1].clientX, dy = touches[0].clientY - touches[1].clientY;
+    return Math.hypot(dx, dy);
   }
-  function onWheel(e) {
-    radius = Math.max(20, Math.min(radius0 * 3, radius + e.deltaY * 0.5));
-    setCamera();
-    e.preventDefault();
+  function onTouchStart(e) {
+    autoRotate = false; clearTimeout(idleTimer);
+    if (e.touches.length === 2) {
+      dragging = false;
+      pinchStartDist = touchDist(e.touches);
+      pinchStartRadius = radius;
+    } else if (e.touches.length === 1) {
+      onDown(e.touches[0].clientX, e.touches[0].clientY);
+    }
+  }
+  function onTouchMove(e) {
+    if (e.touches.length === 2 && pinchStartDist != null) {
+      const d = touchDist(e.touches);
+      radius = Math.max(MIN_RADIUS, Math.min(MAX_RADIUS, pinchStartRadius * (pinchStartDist / d)));
+      setCamera();
+    } else if (e.touches.length === 1) {
+      onMove(e.touches[0].clientX, e.touches[0].clientY);
+    }
   }
   canvas.addEventListener('mousedown', (e) => onDown(e.clientX, e.clientY));
   window.addEventListener('mousemove', onWindowMouseMove);
   window.addEventListener('mouseup', onUp);
-  canvas.addEventListener('touchstart', (e) => { const t = e.touches[0]; onDown(t.clientX, t.clientY); }, { passive: true });
-  canvas.addEventListener('touchmove', (e) => { const t = e.touches[0]; onMove(t.clientX, t.clientY); }, { passive: true });
+  canvas.addEventListener('touchstart', onTouchStart, { passive: true });
+  canvas.addEventListener('touchmove', onTouchMove, { passive: true });
   canvas.addEventListener('touchend', onUp);
   canvas.addEventListener('wheel', onWheel, { passive: false });
+  const zoomInBtn = document.getElementById('zoomInBtn');
+  const zoomOutBtn = document.getElementById('zoomOutBtn');
+  if (zoomInBtn) zoomInBtn.onclick = () => zoomBy(0.8);
+  if (zoomOutBtn) zoomOutBtn.onclick = () => zoomBy(1.25);
 
   let raf;
   function animate() {
@@ -1195,9 +1243,6 @@ function init3D(stats, hunt, elevData) {
     renderer.setSize(W(), H());
   }
   window.addEventListener('resize', onResize);
-  // Two-tier re-measure, same fix as the Leaflet maps: right after the
-  // innerHTML swap the wrapper can still read 0×0 for a tick, which would
-  // otherwise leave the WebGL canvas sized to nothing.
   setTimeout(onResize, 0);
   setTimeout(onResize, 250);
 
@@ -1208,10 +1253,6 @@ function init3D(stats, hunt, elevData) {
     window.removeEventListener('mouseup', onUp);
     window.removeEventListener('hashchange', cleanup);
     clearTimeout(idleTimer);
-    // Explicitly free the WebGL context instead of waiting on garbage
-    // collection — repeated visits to this view without this would
-    // eventually exhaust the browser's limited number of WebGL contexts
-    // and silently break future 3D views.
     renderer.dispose();
   };
   window.addEventListener('hashchange', cleanup, { once: true });
