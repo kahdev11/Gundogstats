@@ -333,7 +333,7 @@ function compassSVG(rotDeg, big) {
 }
 
 /* ---------------- app state & routing ---------------- */
-const APP_VERSION = '2026-08-29.16';
+const APP_VERSION = '2026-08-29.17';
 const root = document.getElementById('app-root');
 let state = { hunts: [], newHunt: null };
 
@@ -642,13 +642,20 @@ async function renderCompare3D(idsCsv) {
           <button id="zoomOutBtn" style="width:38px;height:38px;border-radius:10px;border:1px solid var(--border);background:rgba(30,42,31,0.85);color:var(--text);font-size:18px;">−</button>
         </div>
       </div>
-      <div class="legend" style="padding:0 20px;margin-top:12px;flex-wrap:wrap;">
-        ${huntsData.map((hd, i) => `<span><span class="swatch" style="background:#${MULTI_HUNT_COLORS[i % MULTI_HUNT_COLORS.length].toString(16).padStart(6, '0')}"></span>${fmt.date(hd.hunt.date)}</span>`).join('')}
-      </div>
-      <div style="display:flex;gap:8px;padding:10px 20px 0;flex-wrap:wrap;">
+      <div style="display:flex;gap:8px;padding:12px 20px 0;flex-wrap:wrap;">
+        <button type="button" class="wind-dir-btn active" id="toggleDogBtn">Hund</button>
         <button type="button" class="wind-dir-btn active" id="toggleHunterBtn">Fører</button>
         <button type="button" class="wind-dir-btn active" id="toggleStandBtn">Stand</button>
         <button type="button" class="wind-dir-btn active" id="toggleBirdBtn">Fuglefunn</button>
+      </div>
+      <div id="huntToggles" style="display:flex;flex-direction:column;gap:6px;padding:10px 20px 0;">
+        ${huntsData.map((hd, i) => `
+          <label style="display:flex;align-items:center;gap:8px;font-size:13px;">
+            <input type="checkbox" class="hunt3d-check" data-idx="${i}" checked style="width:16px;height:16px;accent-color:#${MULTI_HUNT_COLORS[i % MULTI_HUNT_COLORS.length].toString(16).padStart(6, '0')};">
+            <span class="swatch" style="background:#${MULTI_HUNT_COLORS[i % MULTI_HUNT_COLORS.length].toString(16).padStart(6, '0')}"></span>
+            <span>${fmt.date(hd.hunt.date)}${hd.hunt.name ? ' — ' + hd.hunt.name : ''}</span>
+          </label>
+        `).join('')}
       </div>
       <p class="note" style="margin:10px 20px 0;">Ett: roter. To: zoom/panorer. Høyreklikk-dra (PC): panorer.</p>
     </main>
@@ -770,15 +777,20 @@ function initMulti3D(huntsData, terrain) {
     return best;
   }
 
-  const hunterGroup = new THREE.Group();
-  const standGroup = new THREE.Group();
-  const birdGroup = new THREE.Group();
-  scene.add(hunterGroup); scene.add(standGroup); scene.add(birdGroup);
+  // Per-hunt, per-type groups so visibility can be controlled by BOTH the
+  // type buttons (Hund/Fører/Stand/Fuglefunn, applied across all hunts) and
+  // the per-hunt checkboxes (hide one whole hunt's worth of layers) — final
+  // visibility is the AND of both.
+  const huntGroups = huntsData.map(() => ({
+    dog: new THREE.Group(), hunter: new THREE.Group(), stand: new THREE.Group(), bird: new THREE.Group(),
+  }));
+  huntGroups.forEach((g) => { scene.add(g.dog); scene.add(g.hunter); scene.add(g.stand); scene.add(g.bird); });
 
   huntsData.forEach((hd, i) => {
     const color = MULTI_HUNT_COLORS[i % MULTI_HUNT_COLORS.length];
+    const g = huntGroups[i];
 
-    // Dog track — the thick tube, always visible, colour-coded per hunt.
+    // Dog track — the thick tube, colour-coded per hunt.
     const pts3 = hd.dogPts.map((p, k) => {
       const [x, z] = project(p.lat, p.lon);
       const y = elevY(hd.elev ? hd.elev[k] : null) + terrainClearance;
@@ -788,10 +800,10 @@ function initMulti3D(huntsData, terrain) {
       const curve = new THREE.CatmullRomCurve3(pts3);
       const tubularSegments = Math.max(2, Math.min(500, pts3.length * 2));
       const tgeo = new THREE.TubeGeometry(curve, tubularSegments, trackR, 6, false);
-      scene.add(new THREE.Mesh(tgeo, new THREE.MeshBasicMaterial({ color })));
+      g.dog.add(new THREE.Mesh(tgeo, new THREE.MeshBasicMaterial({ color })));
     }
 
-    // Hunter track — thinner tube, same colour as this hunt, toggleable.
+    // Hunter track — thinner tube, same colour as this hunt.
     if (hd.hunterPts && hd.hunterPts.length > 1 && hd.elev) {
       const hPts3 = hd.hunterPts.map((p) => {
         const [x, z] = project(p.lat, p.lon);
@@ -802,24 +814,24 @@ function initMulti3D(huntsData, terrain) {
         const hCurve = new THREE.CatmullRomCurve3(hPts3);
         const hSeg = Math.max(2, Math.min(400, hPts3.length * 2));
         const hGeo = new THREE.TubeGeometry(hCurve, hSeg, trackR * 0.45, 6, false);
-        hunterGroup.add(new THREE.Mesh(hGeo, new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.6 })));
+        g.hunter.add(new THREE.Mesh(hGeo, new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.6 })));
       }
     }
 
-    // Stands — small spheres in this hunt's colour, toggleable.
+    // Stands — small spheres in this hunt's colour.
     hd.stands.forEach((s) => {
       const idx = nearestDogIdx(hd, s.lat, s.lon);
       const [x, z] = project(s.lat, s.lon);
       const y = elevY(hd.elev ? hd.elev[idx] : null);
       const sph = new THREE.Mesh(new THREE.SphereGeometry(markerR, 14, 14), new THREE.MeshBasicMaterial({ color }));
       sph.position.set(x, y + markerR * 1.4, z);
-      standGroup.add(sph);
+      g.stand.add(sph);
       const pole = new THREE.Mesh(new THREE.CylinderGeometry(markerR * 0.12, markerR * 0.12, markerR * 1.4, 8), new THREE.MeshBasicMaterial({ color }));
       pole.position.set(x, y + (markerR * 1.4) / 2, z);
-      standGroup.add(pole);
+      g.stand.add(pole);
     });
 
-    // Bird sightings — small cones in this hunt's colour, toggleable.
+    // Bird sightings — small cones in this hunt's colour.
     hd.birds.forEach((b) => {
       const idx = nearestDogIdx(hd, b.lat, b.lon);
       const [x, z] = project(b.lat, b.lon);
@@ -827,24 +839,43 @@ function initMulti3D(huntsData, terrain) {
       const poleHeight = markerR * 1.9;
       const cone = new THREE.Mesh(new THREE.ConeGeometry(markerR * 1.1, markerR * 1.8, 12), new THREE.MeshBasicMaterial({ color }));
       cone.position.set(x, y + poleHeight + markerR * 0.8, z);
-      birdGroup.add(cone);
+      g.bird.add(cone);
       const pole = new THREE.Mesh(new THREE.CylinderGeometry(markerR * 0.12, markerR * 0.12, poleHeight, 8), new THREE.MeshBasicMaterial({ color }));
       pole.position.set(x, y + poleHeight / 2, z);
-      birdGroup.add(pole);
+      g.bird.add(pole);
     });
   });
 
-  function wireToggle(btnId, group) {
+  const typeVisible = { dog: true, hunter: true, stand: true, bird: true };
+  const huntVisible = huntsData.map(() => true);
+  function updateVisibility() {
+    huntGroups.forEach((g, i) => {
+      g.dog.visible = huntVisible[i] && typeVisible.dog;
+      g.hunter.visible = huntVisible[i] && typeVisible.hunter;
+      g.stand.visible = huntVisible[i] && typeVisible.stand;
+      g.bird.visible = huntVisible[i] && typeVisible.bird;
+    });
+  }
+  updateVisibility();
+  function wireTypeToggle(btnId, key) {
     const btn = document.getElementById(btnId);
     if (!btn) return;
     btn.onclick = () => {
-      group.visible = !group.visible;
-      btn.classList.toggle('active', group.visible);
+      typeVisible[key] = !typeVisible[key];
+      btn.classList.toggle('active', typeVisible[key]);
+      updateVisibility();
     };
   }
-  wireToggle('toggleHunterBtn', hunterGroup);
-  wireToggle('toggleStandBtn', standGroup);
-  wireToggle('toggleBirdBtn', birdGroup);
+  wireTypeToggle('toggleDogBtn', 'dog');
+  wireTypeToggle('toggleHunterBtn', 'hunter');
+  wireTypeToggle('toggleStandBtn', 'stand');
+  wireTypeToggle('toggleBirdBtn', 'bird');
+  document.querySelectorAll('.hunt3d-check').forEach((el) => {
+    el.onchange = () => {
+      huntVisible[Number(el.dataset.idx)] = el.checked;
+      updateVisibility();
+    };
+  });
 
   const spanX = Math.max(maxX - minX, 50), spanZ = Math.max(maxZ - minZ, 50);
   const centerX = (minX + maxX) / 2, centerZ = (minZ + maxZ) / 2;
