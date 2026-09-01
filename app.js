@@ -333,7 +333,7 @@ function compassSVG(rotDeg, big) {
 }
 
 /* ---------------- app state & routing ---------------- */
-const APP_VERSION = '2026-08-29.15';
+const APP_VERSION = '2026-08-29.16';
 const root = document.getElementById('app-root');
 let state = { hunts: [], newHunt: null };
 
@@ -620,7 +620,11 @@ async function renderCompare3D(idsCsv) {
   const allHunts = await dbGetAll();
   const hunts = ids.map((id) => allHunts.find((h) => h.id === id)).filter(Boolean);
   if (hunts.length < 2) { navigate('compare'); return; }
-  const huntsData = hunts.map((h) => ({ hunt: h, dogPts: h.dogPts.slice(h.trimStart, h.trimEnd + 1) }));
+  const huntsData = hunts.map((h) => {
+    const dogPts = h.dogPts.slice(h.trimStart, h.trimEnd + 1);
+    const hunterPts = h.hunterPts ? h.hunterPts.filter((p) => p.t >= dogPts[0].t && p.t <= dogPts[dogPts.length - 1].t) : null;
+    return { hunt: h, dogPts, hunterPts, stands: detectStands(dogPts), birds: h.birdSightings || [] };
+  });
 
   root.innerHTML = `
     <header class="topbar">
@@ -641,6 +645,11 @@ async function renderCompare3D(idsCsv) {
       <div class="legend" style="padding:0 20px;margin-top:12px;flex-wrap:wrap;">
         ${huntsData.map((hd, i) => `<span><span class="swatch" style="background:#${MULTI_HUNT_COLORS[i % MULTI_HUNT_COLORS.length].toString(16).padStart(6, '0')}"></span>${fmt.date(hd.hunt.date)}</span>`).join('')}
       </div>
+      <div style="display:flex;gap:8px;padding:10px 20px 0;flex-wrap:wrap;">
+        <button type="button" class="wind-dir-btn active" id="toggleHunterBtn">Fører</button>
+        <button type="button" class="wind-dir-btn active" id="toggleStandBtn">Stand</button>
+        <button type="button" class="wind-dir-btn active" id="toggleBirdBtn">Fuglefunn</button>
+      </div>
       <p class="note" style="margin:10px 20px 0;">Ett: roter. To: zoom/panorer. Høyreklikk-dra (PC): panorer.</p>
     </main>
   `;
@@ -650,7 +659,10 @@ async function renderCompare3D(idsCsv) {
   const statusEl = document.getElementById('three-status');
 
   const lats = [], lons = [];
-  huntsData.forEach((hd) => hd.dogPts.forEach((p) => { lats.push(p.lat); lons.push(p.lon); }));
+  huntsData.forEach((hd) => {
+    hd.dogPts.forEach((p) => { lats.push(p.lat); lons.push(p.lon); });
+    if (hd.hunterPts) hd.hunterPts.forEach((p) => { lats.push(p.lat); lons.push(p.lon); });
+  });
   const bbox = { minLat: Math.min(...lats), maxLat: Math.max(...lats), minLon: Math.min(...lons), maxLon: Math.max(...lons) };
 
   let terrain = null;
@@ -738,23 +750,101 @@ function initMulti3D(huntsData, terrain) {
       minX = Math.min(minX, x); maxX = Math.max(maxX, x);
       minZ = Math.min(minZ, z); maxZ = Math.max(maxZ, z);
     });
+    if (hd.hunterPts) hd.hunterPts.forEach((p) => {
+      const [x, z] = project(p.lat, p.lon);
+      minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+      minZ = Math.min(minZ, z); maxZ = Math.max(maxZ, z);
+    });
   });
   const trackR = Math.max(0.35, Math.max(maxX - minX, maxZ - minZ) * 0.0032);
   const terrainClearance = trackR * 2.4;
+  const markerR = Math.max(1, Math.max(maxX - minX, maxZ - minZ) * 0.009);
+
+  // Nearest-dog-point elevation lookup, reused for hunter/stand/bird height.
+  function nearestDogIdx(hd, lat, lon) {
+    let best = 0, bestD = Infinity;
+    hd.dogPts.forEach((dp, i) => {
+      const dd = haversine(lat, lon, dp.lat, dp.lon);
+      if (dd < bestD) { bestD = dd; best = i; }
+    });
+    return best;
+  }
+
+  const hunterGroup = new THREE.Group();
+  const standGroup = new THREE.Group();
+  const birdGroup = new THREE.Group();
+  scene.add(hunterGroup); scene.add(standGroup); scene.add(birdGroup);
 
   huntsData.forEach((hd, i) => {
     const color = MULTI_HUNT_COLORS[i % MULTI_HUNT_COLORS.length];
+
+    // Dog track — the thick tube, always visible, colour-coded per hunt.
     const pts3 = hd.dogPts.map((p, k) => {
       const [x, z] = project(p.lat, p.lon);
       const y = elevY(hd.elev ? hd.elev[k] : null) + terrainClearance;
       return new THREE.Vector3(x, y, z);
     });
-    if (pts3.length < 2) return;
-    const curve = new THREE.CatmullRomCurve3(pts3);
-    const tubularSegments = Math.max(2, Math.min(500, pts3.length * 2));
-    const tgeo = new THREE.TubeGeometry(curve, tubularSegments, trackR, 6, false);
-    scene.add(new THREE.Mesh(tgeo, new THREE.MeshBasicMaterial({ color })));
+    if (pts3.length >= 2) {
+      const curve = new THREE.CatmullRomCurve3(pts3);
+      const tubularSegments = Math.max(2, Math.min(500, pts3.length * 2));
+      const tgeo = new THREE.TubeGeometry(curve, tubularSegments, trackR, 6, false);
+      scene.add(new THREE.Mesh(tgeo, new THREE.MeshBasicMaterial({ color })));
+    }
+
+    // Hunter track — thinner tube, same colour as this hunt, toggleable.
+    if (hd.hunterPts && hd.hunterPts.length > 1 && hd.elev) {
+      const hPts3 = hd.hunterPts.map((p) => {
+        const [x, z] = project(p.lat, p.lon);
+        const y = elevY(hd.elev[nearestDogIdx(hd, p.lat, p.lon)]) + terrainClearance * 1.4;
+        return new THREE.Vector3(x, y, z);
+      });
+      if (hPts3.length >= 2) {
+        const hCurve = new THREE.CatmullRomCurve3(hPts3);
+        const hSeg = Math.max(2, Math.min(400, hPts3.length * 2));
+        const hGeo = new THREE.TubeGeometry(hCurve, hSeg, trackR * 0.45, 6, false);
+        hunterGroup.add(new THREE.Mesh(hGeo, new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.6 })));
+      }
+    }
+
+    // Stands — small spheres in this hunt's colour, toggleable.
+    hd.stands.forEach((s) => {
+      const idx = nearestDogIdx(hd, s.lat, s.lon);
+      const [x, z] = project(s.lat, s.lon);
+      const y = elevY(hd.elev ? hd.elev[idx] : null);
+      const sph = new THREE.Mesh(new THREE.SphereGeometry(markerR, 14, 14), new THREE.MeshBasicMaterial({ color }));
+      sph.position.set(x, y + markerR * 1.4, z);
+      standGroup.add(sph);
+      const pole = new THREE.Mesh(new THREE.CylinderGeometry(markerR * 0.12, markerR * 0.12, markerR * 1.4, 8), new THREE.MeshBasicMaterial({ color }));
+      pole.position.set(x, y + (markerR * 1.4) / 2, z);
+      standGroup.add(pole);
+    });
+
+    // Bird sightings — small cones in this hunt's colour, toggleable.
+    hd.birds.forEach((b) => {
+      const idx = nearestDogIdx(hd, b.lat, b.lon);
+      const [x, z] = project(b.lat, b.lon);
+      const y = elevY(hd.elev ? hd.elev[idx] : null);
+      const poleHeight = markerR * 1.9;
+      const cone = new THREE.Mesh(new THREE.ConeGeometry(markerR * 1.1, markerR * 1.8, 12), new THREE.MeshBasicMaterial({ color }));
+      cone.position.set(x, y + poleHeight + markerR * 0.8, z);
+      birdGroup.add(cone);
+      const pole = new THREE.Mesh(new THREE.CylinderGeometry(markerR * 0.12, markerR * 0.12, poleHeight, 8), new THREE.MeshBasicMaterial({ color }));
+      pole.position.set(x, y + poleHeight / 2, z);
+      birdGroup.add(pole);
+    });
   });
+
+  function wireToggle(btnId, group) {
+    const btn = document.getElementById(btnId);
+    if (!btn) return;
+    btn.onclick = () => {
+      group.visible = !group.visible;
+      btn.classList.toggle('active', group.visible);
+    };
+  }
+  wireToggle('toggleHunterBtn', hunterGroup);
+  wireToggle('toggleStandBtn', standGroup);
+  wireToggle('toggleBirdBtn', birdGroup);
 
   const spanX = Math.max(maxX - minX, 50), spanZ = Math.max(maxZ - minZ, 50);
   const centerX = (minX + maxX) / 2, centerZ = (minZ + maxZ) / 2;
