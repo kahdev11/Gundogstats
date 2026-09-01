@@ -333,7 +333,7 @@ function compassSVG(rotDeg, big) {
 }
 
 /* ---------------- app state & routing ---------------- */
-const APP_VERSION = '2026-08-29.14';
+const APP_VERSION = '2026-08-29.15';
 const root = document.getElementById('app-root');
 let state = { hunts: [], newHunt: null };
 
@@ -363,6 +363,7 @@ async function router() {
   else if (view === 'hunt3d' && payload) renderHunt3D(payload);
   else if (view === 'endurance') renderEndurance();
   else if (view === 'compare') renderCompare();
+  else if (view === 'compare3d' && payload) renderCompare3D(payload);
   else renderDashboard();
 }
 window.addEventListener('hashchange', router);
@@ -561,10 +562,16 @@ async function renderCompare() {
           </label>
         `).join('')}
       </div>
+      <button class="btn btn-primary btn-block" id="compare3dBtn" style="margin:2px 0 16px;">Vis valgte spor i 3D</button>
       <div id="compareCharts"></div>
     </main>
   `;
   document.getElementById('backBtn').onclick = () => navigate('');
+  document.getElementById('compare3dBtn').onclick = () => {
+    const ids = Array.from(document.querySelectorAll('.hunt-check:checked')).map((el) => el.dataset.id);
+    if (ids.length < 2) { toast('Velg minst to turer'); return; }
+    navigate('compare3d', ids.join(','));
+  };
 
   function draw() {
     const selectedIds = new Set(
@@ -603,6 +610,165 @@ async function renderCompare() {
   }
   document.querySelectorAll('.hunt-check').forEach((el) => { el.onchange = draw; });
   draw();
+}
+
+/* ---------------- Multi-hunt 3D overlay: one track colour per hunt, on one shared terrain ---------------- */
+const MULTI_HUNT_COLORS = [0x2fe6c9, 0xff8a3d, 0xc6e94c, 0x4fc3f7, 0xff6b6b, 0xb47eea];
+
+async function renderCompare3D(idsCsv) {
+  const ids = idsCsv.split(',');
+  const allHunts = await dbGetAll();
+  const hunts = ids.map((id) => allHunts.find((h) => h.id === id)).filter(Boolean);
+  if (hunts.length < 2) { navigate('compare'); return; }
+  const huntsData = hunts.map((h) => ({ hunt: h, dogPts: h.dogPts.slice(h.trimStart, h.trimEnd + 1) }));
+
+  root.innerHTML = `
+    <header class="topbar">
+      <div class="back-row" style="padding:0;">
+        <button class="back-btn" id="backBtn">←</button>
+        <div class="hunt-title">Spor i 3D — sammenligning</div>
+      </div>
+    </header>
+    <main style="padding-left:0;padding-right:0;">
+      <div id="three-status" class="note" style="margin:0 20px 10px;">Henter terreng for området …</div>
+      <div id="three-wrap" style="width:100%;height:60vh;min-height:360px;position:relative;background:radial-gradient(ellipse at 50% 20%, #1c2a1d, #0d130e);">
+        <canvas id="three-canvas" style="display:block;width:100%;height:100%;touch-action:none;"></canvas>
+        <div style="position:absolute;right:10px;bottom:10px;display:flex;flex-direction:column;gap:6px;">
+          <button id="zoomInBtn" style="width:38px;height:38px;border-radius:10px;border:1px solid var(--border);background:rgba(30,42,31,0.85);color:var(--text);font-size:18px;">+</button>
+          <button id="zoomOutBtn" style="width:38px;height:38px;border-radius:10px;border:1px solid var(--border);background:rgba(30,42,31,0.85);color:var(--text);font-size:18px;">−</button>
+        </div>
+      </div>
+      <div class="legend" style="padding:0 20px;margin-top:12px;flex-wrap:wrap;">
+        ${huntsData.map((hd, i) => `<span><span class="swatch" style="background:#${MULTI_HUNT_COLORS[i % MULTI_HUNT_COLORS.length].toString(16).padStart(6, '0')}"></span>${fmt.date(hd.hunt.date)}</span>`).join('')}
+      </div>
+      <p class="note" style="margin:10px 20px 0;">Ett: roter. To: zoom/panorer. Høyreklikk-dra (PC): panorer.</p>
+    </main>
+  `;
+  let cancelled = false;
+  window.addEventListener('hashchange', () => { cancelled = true; }, { once: true });
+  document.getElementById('backBtn').onclick = () => navigate('compare');
+  const statusEl = document.getElementById('three-status');
+
+  const lats = [], lons = [];
+  huntsData.forEach((hd) => hd.dogPts.forEach((p) => { lats.push(p.lat); lons.push(p.lon); }));
+  const bbox = { minLat: Math.min(...lats), maxLat: Math.max(...lats), minLon: Math.min(...lons), maxLon: Math.max(...lons) };
+
+  let terrain = null;
+  try {
+    for (const hd of huntsData) {
+      const result = await fetchElevationsSmart(hd.dogPts);
+      if (cancelled) return;
+      hd.elev = result.elevs;
+    }
+    terrain = await fetchTerrainGrid(bbox.minLat, bbox.maxLat, bbox.minLon, bbox.maxLon, 30);
+    if (cancelled) return;
+    statusEl.textContent = `${huntsData.length} turer vist på samme terreng — sammenlign dekningsområdet.`;
+  } catch (err) {
+    if (cancelled) return;
+    statusEl.textContent = 'Fikk ikke hentet terreng akkurat nå — prøv igjen senere.';
+    return;
+  }
+  if (cancelled) return;
+
+  try {
+    initMulti3D(huntsData, terrain);
+  } catch (err) {
+    if (!cancelled) statusEl.textContent = '3D-visning feilet på denne enheten.';
+  }
+}
+
+function initMulti3D(huntsData, terrain) {
+  const canvas = document.getElementById('three-canvas');
+  const wrap = document.getElementById('three-wrap');
+  const W = () => wrap.clientWidth, H = () => wrap.clientHeight;
+
+  const allDogPts = [].concat(...huntsData.map((hd) => hd.dogPts));
+  const lat0 = allDogPts[Math.floor(allDogPts.length / 2)].lat;
+  const lon0 = allDogPts[Math.floor(allDogPts.length / 2)].lon;
+  const mPerLat = 111320;
+  const mPerLon = 111320 * Math.cos(toRad(lat0));
+  const project = (lat, lon) => [(lon - lon0) * mPerLon, (lat - lat0) * mPerLat];
+
+  const VERTICAL_EXAGGERATION = 1.8;
+  const allElevs = [].concat(
+    ...huntsData.map((hd) => hd.elev || []),
+    terrain ? terrain.grid.map((g) => g.elev).filter((e) => e != null) : []
+  );
+  const minElev = allElevs.length ? Math.min(...allElevs) : 0;
+  const elevY = (e) => (e == null ? 0 : (e - minElev) * VERTICAL_EXAGGERATION);
+
+  const scene = new THREE.Scene();
+  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+
+  if (terrain) {
+    const n = terrain.gridN;
+    const positions = [], colors = [];
+    const terrainElevs = terrain.grid.map((g) => g.elev).filter((e) => e != null);
+    const tMin = Math.min(...terrainElevs), tMax = Math.max(...terrainElevs) || tMin + 1;
+    const low = new THREE.Color(0x2e4a30), high = new THREE.Color(0xb99b6b);
+    terrain.grid.forEach((g) => {
+      const [x, z] = project(g.lat, g.lon);
+      const e = g.elev == null ? tMin : g.elev;
+      const y = elevY(e);
+      positions.push(x, y, z);
+      const frac = tMax > tMin ? (e - tMin) / (tMax - tMin) : 0;
+      const col = low.clone().lerp(high, frac);
+      colors.push(col.r, col.g, col.b);
+      minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+      minZ = Math.min(minZ, z); maxZ = Math.max(maxZ, z);
+    });
+    const indices = [];
+    for (let i = 0; i < n - 1; i++) {
+      for (let j = 0; j < n - 1; j++) {
+        const a = i * n + j, b = i * n + j + 1, c = (i + 1) * n + j, d = (i + 1) * n + j + 1;
+        indices.push(a, c, b, b, c, d);
+      }
+    }
+    const tgeo = new THREE.BufferGeometry();
+    tgeo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    tgeo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+    tgeo.setIndex(indices);
+    tgeo.computeVertexNormals();
+    scene.add(new THREE.Mesh(tgeo, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide })));
+  }
+
+  huntsData.forEach((hd, i) => {
+    hd.dogPts.forEach((p) => {
+      const [x, z] = project(p.lat, p.lon);
+      minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+      minZ = Math.min(minZ, z); maxZ = Math.max(maxZ, z);
+    });
+  });
+  const trackR = Math.max(0.35, Math.max(maxX - minX, maxZ - minZ) * 0.0032);
+  const terrainClearance = trackR * 2.4;
+
+  huntsData.forEach((hd, i) => {
+    const color = MULTI_HUNT_COLORS[i % MULTI_HUNT_COLORS.length];
+    const pts3 = hd.dogPts.map((p, k) => {
+      const [x, z] = project(p.lat, p.lon);
+      const y = elevY(hd.elev ? hd.elev[k] : null) + terrainClearance;
+      return new THREE.Vector3(x, y, z);
+    });
+    if (pts3.length < 2) return;
+    const curve = new THREE.CatmullRomCurve3(pts3);
+    const tubularSegments = Math.max(2, Math.min(500, pts3.length * 2));
+    const tgeo = new THREE.TubeGeometry(curve, tubularSegments, trackR, 6, false);
+    scene.add(new THREE.Mesh(tgeo, new THREE.MeshBasicMaterial({ color })));
+  });
+
+  const spanX = Math.max(maxX - minX, 50), spanZ = Math.max(maxZ - minZ, 50);
+  const centerX = (minX + maxX) / 2, centerZ = (minZ + maxZ) / 2;
+  const maxElevSeen = allElevs.length ? (Math.max(...allElevs) - minElev) * VERTICAL_EXAGGERATION : 0;
+  const target = new THREE.Vector3(centerX, maxElevSeen / 2 + 2, centerZ);
+  const gridSize = Math.max(spanX, spanZ) * 1.4;
+  const radius0 = Math.max(spanX, spanZ) * 0.9 + 40;
+
+  const camera = new THREE.PerspectiveCamera(52, W() / H(), 0.1, gridSize * 6 + 1000);
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.setSize(W(), H());
+
+  setupOrbitControls({ canvas, W, H, camera, renderer, scene, target, spanX, spanZ, radius0 });
 }
 
 /* ---------------- New hunt flow ---------------- */
@@ -1503,14 +1669,23 @@ function init3D(stats, hunt, elevData) {
   const target = new THREE.Vector3(centerX, maxElevSeen / 2 + 2, centerZ);
   const gridSize = Math.max(spanX, spanZ) * 1.4;
   const radius0 = Math.max(spanX, spanZ) * 0.9 + 40;
-  const MIN_RADIUS = Math.max(spanX, spanZ) * 0.08 + 5;
-  const MAX_RADIUS = radius0 * 4;
 
   const camera = new THREE.PerspectiveCamera(52, W() / H(), 0.1, gridSize * 6 + 1000);
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
   renderer.setSize(W(), H());
 
+  setupOrbitControls({ canvas, W, H, camera, renderer, scene, target, spanX, spanZ, radius0 });
+}
+
+// Shared rotate/pan/zoom camera rig for both the single-hunt and multi-hunt
+// 3D views — one-finger orbits, two-finger pinches to zoom and pans by its
+// midpoint, right-click-drag pans on desktop, with +/- buttons as a fallback.
+// Self-starts the render loop and cleans up (including freeing the WebGL
+// context) on the next hashchange.
+function setupOrbitControls({ canvas, W, H, camera, renderer, scene, target, spanX, spanZ, radius0 }) {
+  const MIN_RADIUS = Math.max(spanX, spanZ) * 0.08 + 5;
+  const MAX_RADIUS = radius0 * 4;
   let azimuth = Math.PI * 0.25, elevAngle = 0.55, radius = radius0;
   let dragging = false, panning = false, lastX = 0, lastY = 0, idleTimer = null, autoRotate = true;
   let pinchStartDist = null, pinchStartRadius = null, pinchLastMidX = null, pinchLastMidY = null;
@@ -1527,9 +1702,6 @@ function init3D(stats, hunt, elevData) {
     radius = Math.max(MIN_RADIUS, Math.min(MAX_RADIUS, radius * factor));
     setCamera();
   }
-  // Pan moves the look-at point itself, in the camera's current left/right
-  // and up/down screen directions — so you can settle the view on one
-  // specific spot instead of only ever orbiting the track's centre.
   function panBy(dxPx, dyPx) {
     const panScale = radius * 0.0016;
     const rightX = Math.sin(azimuth), rightZ = -Math.cos(azimuth);
@@ -1577,7 +1749,6 @@ function init3D(stats, hunt, elevData) {
   }
   function onTouchMove(e) {
     if (e.touches.length === 2 && pinchStartDist != null) {
-      // Two fingers: pinch distance zooms, midpoint movement pans — both at once, as expected.
       const d = touchDist(e.touches);
       radius = Math.max(MIN_RADIUS, Math.min(MAX_RADIUS, pinchStartRadius * (pinchStartDist / d)));
       const mid = touchMid(e.touches);
